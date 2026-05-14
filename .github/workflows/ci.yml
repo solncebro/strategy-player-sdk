@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Type check
+        run: yarn lint
+
+      - name: Build
+        run: yarn build
+
+      - name: Run tests
+        run: yarn test
+
+      - name: Verify dist contains declarations
+        run: |
+          test -f dist/index.d.ts
+          test -f dist/runtime/index.d.ts
+          test -f dist/testing/index.d.ts
+          test -f dist/index.js
+          test -f dist/runtime/index.js
+          test -f dist/testing/index.js
