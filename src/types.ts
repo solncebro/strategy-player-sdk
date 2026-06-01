@@ -14,6 +14,8 @@ export interface MaValues {
   ma50: number;
   ma100: number;
   ma200: number;
+  ma99?: number | null;
+  ma1000?: number | null;
 }
 
 export interface PositionOptions {
@@ -106,12 +108,19 @@ export interface CommissionConfig {
   takerRate: number;
 }
 
+export interface TimeframeData {
+  resolution: string;
+  barList: Bar[];
+  auxSeriesData?: AuxSeriesData;
+}
+
 export interface BacktestContextOptions {
   commission?: CommissionConfig;
   fundingRateList?: FundingRate[];
   params?: Record<string, ParamValue>;
   rawConfig?: Record<string, unknown>;
   auxSeriesData?: AuxSeriesData;
+  timeframeDataList?: TimeframeData[];
 }
 
 export interface BacktestContextResult {
@@ -144,7 +153,7 @@ export interface BacktestMetrics {
   maxDrawdown: number;
   maxDrawdownPercent: number;
   sharpeRatio: number;
-  profitFactor: number;
+  profitFactor: number | null;
   maxConsecutiveLosses: number;
   avgTradeDuration: number;
 }
@@ -187,25 +196,44 @@ export interface TradingEnv {
   getBalance(): number;
   getBarIndex(): number;
   getCurrentBar(): Bar;
-  getHistory(count: number): Bar[];
+  getHistory(count: number, resolution?: string): Bar[];
 
-  getOiClose(): number | null;
-  getLiqLongUsd(): number | null;
-  getLiqShortUsd(): number | null;
-  getLongShortRatio(): number | null;
+  getOiClose(resolution?: string): number | null;
+  getLiqLongUsd(resolution?: string): number | null;
+  getLiqShortUsd(resolution?: string): number | null;
+  getLongShortRatio(resolution?: string): number | null;
   getCurrentFundingRate(): number | null;
   getRecentFundingRates(count: number): number[];
-  getAuxHistory(series: AuxSeriesKind, count: number): Array<number | null>;
+  getAuxHistory(series: AuxSeriesKind, count: number, resolution?: string): Array<number | null>;
+
+  getMaValues?(resolution: string): MaValues;
+  getVolume24h?(resolution?: string): number | null;
 
   getParam<T extends ParamValue = ParamValue>(key: string, defaultValue: T): T;
   getConfig(): Record<string, unknown>;
   emitEvent(type: string, data: Record<string, unknown>): void;
 }
 
+export interface ParamsValidationResult {
+  ok: boolean;
+  error?: string;
+}
+
+export interface CreateTradingEnvOptions {
+  parsedParams: unknown;
+  symbol: string;
+  resolution: string;
+  fundingRateList?: FundingRate[];
+}
+
 export interface Strategy {
   name: string;
   version: string;
   params: Record<string, ParamValue>;
+  allowedResolutions?: string[];
+  requiredTimeframes?: Record<string, number>;
+  validateParams?(parsed: unknown): ParamsValidationResult;
+  createTradingEnv?(innerEnv: TradingEnv, options: CreateTradingEnvOptions): TradingEnv;
   init?(env: TradingEnv): void;
   onBar(bar: Bar, maValues: MaValues, env: TradingEnv): void;
   onOrderFill?(order: FilledOrder, env: TradingEnv): void;

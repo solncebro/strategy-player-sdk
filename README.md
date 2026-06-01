@@ -7,7 +7,7 @@ Stable contract between [strategy-player](https://github.com/solncebro/strategy-
 ## Install
 
 ```bash
-yarn add git+ssh://git@github.com:solncebro/strategy-player-sdk.git#v1.0.0
+yarn add git+ssh://git@github.com:solncebro/strategy-player-sdk.git#v1.6.0
 ```
 
 For local development (when working on this SDK):
@@ -101,4 +101,4 @@ describe("my strategy", () => {
 
 ## Versioning
 
-`v1.0.0` freezes the API surface. Future `v1.x` releases add optional methods/fields only — never break or remove. Breaking changes ship as `v2.0.0` with a migration guide. See [`CHANGELOG.md`](./CHANGELOG.md).
+Current release is `v1.6.0`. Future `v1.x` releases add optional methods/fields only — never break or remove. Breaking changes ship as `v2.0.0` with a migration guide. See [`CHANGELOG.md`](./CHANGELOG.md).

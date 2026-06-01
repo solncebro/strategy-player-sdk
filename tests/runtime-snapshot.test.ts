@@ -47,12 +47,18 @@ describe("StrategyRuntimeContext — runtime snapshot", () => {
     expect(ctx.getBalance()).toBe(10010);
   });
 
-  it("throws when opening position while one is open", () => {
+  it("opens additional position alongside existing one with unique id", () => {
     const ctx = new StrategyRuntimeContext(10000);
     ctx.processBar(makeBar(100));
     ctx.openLong(100);
+    ctx.openShort(100);
 
-    expect(() => ctx.openShort(100)).toThrow("position already open");
+    const positionList = ctx.getPositionList();
+
+    expect(positionList).toHaveLength(2);
+    expect(positionList[0].side).toBe("long");
+    expect(positionList[1].side).toBe("short");
+    expect(positionList[0].id).not.toBe(positionList[1].id);
   });
 
   it("throws when closing wrong side", () => {

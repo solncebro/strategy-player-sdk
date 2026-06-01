@@ -10,6 +10,7 @@ import type {
   PendingOrder,
   Position,
   Strategy,
+  TimeframeData,
   Trade,
 } from "../types";
 import { StrategyRuntimeContext } from "../runtime/strategy-runtime-context";
@@ -21,6 +22,7 @@ export interface MockTradingEnvOptions {
   params?: Record<string, ParamValue>;
   rawConfig?: Record<string, unknown>;
   auxSeriesData?: AuxSeriesData;
+  timeframeDataList?: TimeframeData[];
 }
 
 export interface FeedBarInput {
@@ -41,6 +43,7 @@ export class MockTradingEnv {
       params: options?.params ?? strategy.params,
       rawConfig: options?.rawConfig,
       auxSeriesData: options?.auxSeriesData,
+      timeframeDataList: options?.timeframeDataList,
     });
     this.runtime.setStrategy(strategy);
     this.strategy = strategy;

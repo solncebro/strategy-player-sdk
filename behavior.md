@@ -1,7 +1,7 @@
 # strategy-player-sdk — Behavior Specification
 
 > **Audience:** authors of trading strategies who write code against `strategy-player-sdk`.
-> **Status:** Canonical. Pinned to `v1.0.0`. Additive evolution only — see CHANGELOG.md.
+> **Status:** Canonical. Pinned to `v1.6.0`. Additive evolution only — see CHANGELOG.md.
 >
 > Read this together with the TypeScript types in `src/types.ts` (or `dist/index.d.ts` after `yarn install`). Types alone tell you the **shape** of the API; this document tells you the **runtime semantics**.
 
@@ -35,6 +35,10 @@ interface Strategy {
   name: string;
   version: string;
   params: Record<string, ParamValue>;            // ParamValue = number | string | boolean
+  allowedResolutions?: string[];                 // main TFs the strategy may run on (v1.6) — see §2.1
+  requiredTimeframes?: Record<string, number>;   // resolution → warm-up bar count (v1.1)
+  validateParams?(parsed: unknown): ParamsValidationResult;                 // v1.2 — see §14
+  createTradingEnv?(innerEnv: TradingEnv, options: CreateTradingEnvOptions): TradingEnv; // v1.3 — see §15
 
   init?(env: TradingEnv): void;                                            // before first bar
   onBar(bar: Bar, maValues: MaValues, env: TradingEnv): void;              // every bar
@@ -44,9 +48,18 @@ interface Strategy {
 }
 ```
 
-Required: `name`, `version`, `params`, `onBar`. Optional: `init`, `onOrderFill`, `onBeforeLimitFill`, `onEnd`.
+Required: `name`, `version`, `params`, `onBar`. Optional: `init`, `onOrderFill`, `onBeforeLimitFill`, `onEnd`, `allowedResolutions`, `requiredTimeframes`, `validateParams`, `createTradingEnv`.
 
 The runtime validates these requirements when loading the strategy. Missing required fields cause the load to fail before the first bar is fed.
+
+### 2.1. allowedResolutions vs requiredTimeframes
+
+Two separate timeframe declarations with different meaning:
+
+- `allowedResolutions?: string[]` (v1.6) — which **main** timeframe(s) the strategy may run on. The platform restricts the run/group resolution selector to this list and rejects other resolutions server-side. Omitted → any supported resolution. One element → locked. Several → whitelist (first is the default selection). This is a platform-level guard; the runtime itself does not enforce it.
+- `requiredTimeframes?: Record<string, number>` (v1.1) — which **secondary** timeframes to preload (resolution → warm-up bar count) for MTF lookups via `getHistory(N, res)`, `getMaValues(res)`, etc. (see §11.1).
+
+Example (`kliner-funding`): `allowedResolutions: ["1"]` (main 1m, where `maValues.ma1000` is available) and `requiredTimeframes: { "60": 99, "240": 99 }` (reads 1h/4h moving averages as trend filters).
 
 ---
 
@@ -203,27 +216,69 @@ Bars arrive in strict chronological order. There are no gaps within a contiguous
 
 ---
 
-## 11. Resolution support (v1.0)
+## 11. Resolution support (v1.1)
 
 Six resolutions are supported by the backtest engine:
 
-| Resolution string | TradingView label |
-|---|---|
-| `"1"` | 1m |
-| `"15"` | 15m |
-| `"30"` | 30m |
-| `"60"` | 1h |
-| `"240"` | 4h |
-| `"1D"` | 1d |
+| Resolution string | TradingView label | Bar duration (ms) |
+|---|---|---|
+| `"1"` | 1m | 60_000 |
+| `"15"` | 15m | 900_000 |
+| `"30"` | 30m | 1_800_000 |
+| `"60"` | 1h | 3_600_000 |
+| `"240"` | 4h | 14_400_000 |
+| `"1D"` | 1d | 86_400_000 |
 
 For `"30"`, `MaValues` (`ma25`, `ma50`, `ma100`, `ma200`) is loaded from a precomputed PostgreSQL table (`klines_30m_metrics`). For other resolutions, MAs are computed at runtime from a rolling window of the bar history. If a precomputed value is missing for a particular bar (gap in source), the runtime fills with `{ ma25: 0, ma50: 0, ma100: 0, ma200: 0 }` — strategies should defensively check for zero before using MAs.
+
+### 11.1. Multi-timeframe (MTF) lookups — v1.1
+
+A strategy may read OHLCV bars, aux series (`oi` / `liqLong` / `liqShort` / `lsr`), and MA values from timeframes **other than** the main backtest resolution. To do this, the strategy declares which timeframes it needs:
+
+```typescript
+export default defineStrategy({
+  name: "Trend-Filtered Pump Short",
+  version: "1.0",
+  params: { /* ... */ },
+  requiredTimeframes: {
+    "1D": 200,     // last 200 daily bars (warm-up window for MA200 on daily)
+    "240": 100,    // last 100 4h bars
+  },
+  onBar(bar, maValues, env) {
+    const dailyHistory = env.getHistory(20, "1D");        // last 20 closed daily bars
+    const dailyMa = env.getMaValues!("1D");               // MA25/50/100/200 on daily, computed on the fly
+    const dailyOi = env.getOiClose("1D");                 // OI close on the most recent closed daily bar
+    /* ... */
+  },
+});
+```
+
+**What the runtime loads:** for each `(resolution, warmupBarCount)` pair in `requiredTimeframes`, the backtest engine fetches bars from `getKlineTable(resolution)` starting from `dateFrom - barDurationMs(resolution) * warmupBarCount` (so the strategy has full warm-up before the first main-TF bar) and the corresponding aux series from CoinGlass tables. Funding rate is shared across all timeframes (8-hour grid) and is **not** parameterized by resolution — use `getCurrentFundingRate()` / `getRecentFundingRates(N)` as before.
+
+**Look-ahead protection:** on each main-TF bar with timestamp `T`, the runtime advances a per-resolution pointer to the **last fully-closed** secondary bar — i.e. the maximum index `i` such that `secondary.barList[i].time + barDurationMs(secondary) ≤ T`. Methods called with a secondary `resolution` argument see only data up to that index. This mirrors live trading, where WebSocket kline streams only push closed bars.
+
+**API shape for MTF reads:**
+
+| Method | Without `resolution` (main TF) | With `resolution` (secondary TF) |
+|---|---|---|
+| `getHistory(N, resolution?)` | last N bars **excluding** the current main bar | last N **closed** bars including the most recent closed one |
+| `getOiClose(resolution?)` | OI at `currentBar.time` (main TF) | OI at the most recent closed secondary bar (or `null` if data is missing) |
+| `getLiqLongUsd / getLiqShortUsd / getLongShortRatio(resolution?)` | same as before | secondary aux at the most recent closed bar |
+| `getAuxHistory(kind, N, resolution?)` | rolling history excluding current main bar | rolling history of closed secondary bars |
+| `getMaValues?(resolution)` | n/a — main MA comes via `onBar(bar, maValues, env)` | MA25/50/100/200 computed from `barList[0..currentIndex]` on the secondary TF; returns zeros until warm-up satisfied |
+
+Note the **subtle difference**: `getHistory(N)` (main TF) excludes the current bar because the current bar is still in flight when `onBar` runs. `getHistory(N, "1D")` (secondary TF) **includes** the most recent closed daily bar because, by definition, that bar's close has already happened by the time the main-TF bar is processed.
+
+**Error semantics:** calling `getHistory(N, "1D")` (or any other resolution-aware method) for a timeframe that is **not** declared in `requiredTimeframes` throws `Error: Timeframe "1D" is not loaded. Declare it in Strategy.requiredTimeframes.` Strategies must declare every timeframe they read.
+
+**Backward compat:** strategies without `requiredTimeframes` (or with an empty object) load nothing extra. Calls to existing methods without a `resolution` argument behave exactly as in `v1.0`.
 
 ---
 
 ## 12. Position constraints
 
-- `openLong()` / `openShort()` throw if any position is already open. Single-position semantics for market orders, kept for backward-compat with simple strategies.
-- `placeLimitOrder()` doesn't have this constraint — each fill creates an independent position. Strategies that need multi-position trading use limit orders (and identify positions by the returned `orderId` → `FilledOrder.positionId`).
+- `openLong()` / `openShort()` create a new position each call. Multiple concurrent positions are allowed; the runtime assigns each its own `id` via the same `nextPositionId++` mechanism as `placeLimitOrder()`. Single-position behavior (one open at a time) is the strategy's responsibility — call `getPositionList()` before `openLong()` if you want at-most-one semantics. (v1.5+; in v1.0–v1.4 these threw on an existing position.)
+- `placeLimitOrder()` — each fill creates an independent position. Multi-position behavior is symmetric to `openLong`/`openShort` since v1.5.
 - `closePosition(positionId?)` without an id closes the first open position (insertion order). With an id, closes that specific position.
 - `closeAllPositions(exitReason?)` closes every open position at the current bar's close with taker commission.
 - `setStopLoss(positionId, price)` updates the SL on a specific position. `setStopLoss(price)` (single argument number) targets the first open position — kept for backward-compat with single-position strategies.
@@ -266,25 +321,110 @@ For `"30"`, `MaValues` (`ma25`, `ma50`, `ma100`, `ma200`) is loaded from a preco
 
 ---
 
-## 14. What the SDK does NOT cover (yet)
+## 14. Params validation — v1.2
 
-- Cross-symbol references (single-symbol per backtest run in v1.0).
-- Higher-timeframe references (single-resolution per backtest run).
+A strategy may export `validateParams?(parsed: unknown): ParamsValidationResult` to validate user-uploaded parameter JSON before it's stored in the backtest engine's database.
+
+```typescript
+export interface ParamsValidationResult {
+  ok: boolean;
+  error?: string;       // human-readable message, used by the player to surface 400 on upload
+}
+
+export default defineStrategy({
+  name: "Funding Strategy",
+  version: "1.0",
+  params: { /* internal defaults */ },
+  validateParams(parsed) {
+    if (!parsed || typeof parsed !== "object") {
+      return { ok: false, error: "Params must be an object" };
+    }
+    const root = parsed as Record<string, unknown>;
+    if (!root.settings || !root.periods) {
+      return { ok: false, error: "Missing required keys: settings, periods" };
+    }
+    return { ok: true };
+  },
+  onBar(bar, ma, env) {
+    const config = env.getConfig();          // full original JSON
+    /* ... */
+  },
+});
+```
+
+**Where it runs:** in the backtest player, on `POST /api/backtest/params/upload`, the platform compiles the strategy bundle (the one already stored in the database for the selected strategyId) and invokes `validateParams(parsed)` on the uploaded JSON. If the result is `{ ok: false }`, the upload returns 400 with the strategy's `error` message. If the strategy doesn't export `validateParams`, the upload accepts any JSON object — the platform doesn't second-guess the strategy.
+
+**Why it lives on the strategy:** each strategy knows the shape of its own parameter file. The platform doesn't impose a universal schema (no more `config.global + comboBySymbol` requirement). A strategy that needs per-symbol parameters checks for that structure itself; a strategy that needs `settings + periods` (like funding configs) checks for that. The same JSON is later available through `env.getConfig()` unchanged, so the strategy parses it itself at runtime.
+
+**Sandbox:** `validateParams` runs in the same VM sandbox as `onBar` — same whitelist of globals, same 5s startup timeout when compiling. It must be pure (no I/O, no `fetch`, no `require`) and reasonably fast.
+
+**Live trading bots** that consume the same strategy bundle don't need `validateParams` — they typically load their own validated config from disk. The method is a contract between strategy authors and the backtest UI.
+
+---
+
+## 15. Custom trading env adapter — v1.3
+
+A strategy may export `createTradingEnv?(innerEnv, options): TradingEnv` — a **factory** that produces a `TradingEnv` adapter wrapping the runtime context. The backtest player invokes it once at the start of a run, before `init` and the bar loop. If the strategy doesn't export `createTradingEnv`, the player passes `innerEnv` (the raw `StrategyRuntimeContext`) directly to `init`/`onBar`/`onEnd`.
+
+```typescript
+export interface CreateTradingEnvOptions {
+  parsedParams: unknown;   // raw params as stored in DB (e.g. file JSON uploaded by the user)
+  symbol: string;          // selected backtest symbol
+  resolution: string;      // backtest main timeframe (e.g. "1", "60")
+}
+```
+
+**Why it exists:** production trading bots have their own `TradingEnv` implementation (e.g. `LiveTradingEnv` in `kliner-autotrade-funding`) that adapts exchange-specific or database-specific data sources into `StrategyRuntimeConfig`. In the backtest engine, the raw param JSON in DB may not match the runtime-config shape the strategy needs. `createTradingEnv` is the **symmetric extension point** that lets strategies bring their own infrastructure-adapter — without proxying or knowing about two formats inside the strategy itself.
+
+**Typical implementation pattern** (in the strategy author's repo, not in the SDK):
+
+```
+src/strategy/                  ← pure strategy (production source of truth)
+└── MyStrategy.ts              ← onBar reads env.getConfig() — only knows StrategyRuntimeConfig
+
+src/infrastructure/            ← production adapter (Firebase / exchange)
+└── LiveTradingEnv.ts          ← implements TradingEnv, builds StrategyRuntimeConfig from Firebase
+
+src/backtest-infrastructure/   ← backtest adapter (file JSON)
+└── BacktestTradingEnvAdapter.ts ← implements TradingEnv, builds StrategyRuntimeConfig from parsedParams
+
+src/strategy-backtest/index.ts ← composition root for backtest bundle:
+                                 default export = { ...inner, createTradingEnv: (env, opt) => new BacktestTradingEnvAdapter(env, opt) }
+```
+
+The strategy itself **does not know which environment it runs in**. Both adapters implement `TradingEnv`; both build the same `StrategyRuntimeConfig` shape through different data sources.
+
+**Runtime semantics (what the player guarantees):**
+- `createTradingEnv` is called **once**, right after the strategy is loaded and the `StrategyRuntimeContext` is constructed. The result is the `env` passed to `init`, every `onBar`, every `onOrderFill` / `onBeforeLimitFill`, and `onEnd`.
+- The inner `StrategyRuntimeContext` continues to handle `processBar`, `forceCloseAll`, and result accumulation — those aren't part of the `TradingEnv` interface and aren't seen by the strategy.
+- Adapter methods that don't change behavior (`openLong`, `placeLimitOrder`, `getHistory`, etc.) **must delegate to `innerEnv`** so position tracking and history work correctly. Only methods the adapter wants to override (commonly `getConfig`) carry custom logic.
+- The adapter runs inside the same sandbox as the strategy (same whitelist of globals, same 5s startup timeout when compiling). No I/O, no Node built-ins.
+
+**Live trading bots:** ignore this extension point — they have their own production `TradingEnv` instantiated outside the SDK contract. `createTradingEnv` is purely a backtest-side convenience.
+
+---
+
+## 16. What the SDK does NOT cover (yet)
+
+- Cross-symbol references (single-symbol per backtest run in v1.x).
 - Slippage / partial fills / market impact.
-- Built-in indicator helpers (RSI, ATR, EMA, Bollinger). Compute them yourself using `getHistory(N)`.
+- Built-in indicator helpers (RSI, ATR, EMA, Bollinger). Compute them yourself using `getHistory(N)` (with or without resolution).
 - Order book snapshots / trades tape.
 
 These are **possible additive extensions** for `v1.x` (or breaking-change candidates for `v2.x`). Open a SDK PR with a concrete strategy use case if you need them.
 
+Higher-timeframe references — added in `v1.1` (see §11.1). Params validation — added in `v1.2` (see §14). Custom trading env adapter — added in `v1.3` (see §15).
+
 ---
 
-## 15. Versioning promise
+## 17. Versioning promise
 
-`v1.0.0` freezes the surface above. Future `v1.x` releases:
+`v1.0.0` froze the surface; `v1.1.0` MTF; `v1.2.0` params validation; `v1.3.0` custom trading env adapter; `v1.4.0` funding history in adapter options; `v1.5.0` multi-position market opens; `v1.6.0` `allowedResolutions`. Future `v1.x` releases:
 - **may** add new optional methods to `TradingEnv` (`method?(): T | null`),
+- **may** add new optional parameters to existing `TradingEnv` methods (`foo(a, b?: string)`),
 - **may** add new optional fields to existing types (`{ existing: ..., newField?: ... }`),
 - **may not** remove or rename anything,
-- **may not** change the runtime semantics described in this file (sandbox limits, fill priority, commission split, funding signs, MFE definition, time-unit conventions, nullability rules).
+- **may not** change the runtime semantics described in this file (sandbox limits, fill priority, commission split, funding signs, MFE definition, time-unit conventions, nullability rules, look-ahead protection).
 
 Breaking changes are reserved for `v2.0.0` and ship with a migration guide.
 

@@ -1,7 +1,9 @@
 import type {
   Bar,
+  CreateTradingEnvOptions,
   FilledOrder,
   MaValues,
+  ParamsValidationResult,
   ParamValue,
   Strategy,
   TradingEnv,
@@ -16,6 +18,10 @@ export interface StrategySpec<TParams extends Record<string, ParamValue>> {
   name: string;
   version: string;
   params: TParams;
+  allowedResolutions?: string[];
+  requiredTimeframes?: Record<string, number>;
+  validateParams?(parsed: unknown): ParamsValidationResult;
+  createTradingEnv?(innerEnv: TradingEnv, options: CreateTradingEnvOptions): TradingEnv;
   init?(env: TypedTradingEnv<TParams>): void;
   onBar(bar: Bar, maValues: MaValues, env: TypedTradingEnv<TParams>): void;
   onOrderFill?(order: FilledOrder, env: TypedTradingEnv<TParams>): void;

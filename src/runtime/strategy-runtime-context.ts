@@ -15,15 +15,28 @@ import type {
   Position,
   PositionOptions,
   Strategy,
+  TimeframeData,
   Trade,
   TradingEnv,
 } from "../types";
+import { barDurationMs } from "./timeframe";
 
 interface ClosePositionByIdArgs {
   positionId: string;
   exitPrice: number;
   exitReason: string;
   commissionType: "maker" | "taker" | null;
+}
+
+interface TimeframeStore {
+  resolution: string;
+  barList: Bar[];
+  auxSeriesData: AuxSeriesData;
+  durationMs: number;
+  currentIndex: number;
+  auxHistoryByKind: Record<AuxSeriesKind, Array<number | null>>;
+  maCacheIndex: number;
+  maCacheValue: MaValues | null;
 }
 
 const EMPTY_AUX_SERIES: AuxSeriesData = {
@@ -34,6 +47,70 @@ const EMPTY_AUX_SERIES: AuxSeriesData = {
 };
 
 const AUX_KIND_LIST: AuxSeriesKind[] = ["oi", "liqLong", "liqShort", "lsr"];
+
+const ZERO_MA_VALUES: MaValues = {
+  ma25: 0,
+  ma50: 0,
+  ma100: 0,
+  ma200: 0,
+  ma99: null,
+  ma1000: null,
+};
+
+function createTimeframeStore(data: TimeframeData): TimeframeStore {
+  const barList = [...data.barList].sort((a, b) => a.time - b.time);
+
+  return {
+    resolution: data.resolution,
+    barList,
+    auxSeriesData: data.auxSeriesData ?? EMPTY_AUX_SERIES,
+    durationMs: barDurationMs(data.resolution),
+    currentIndex: -1,
+    auxHistoryByKind: { oi: [], liqLong: [], liqShort: [], lsr: [] },
+    maCacheIndex: -2,
+    maCacheValue: null,
+  };
+}
+
+function getAuxMapFor(data: AuxSeriesData, kind: AuxSeriesKind): Map<number, number> {
+  if (kind === "oi") return data.oiByTime;
+  if (kind === "liqLong") return data.liqLongByTime;
+  if (kind === "liqShort") return data.liqShortByTime;
+  return data.lsrByTime;
+}
+
+const MA_PERIOD_LIST = [
+  { period: 25, key: "ma25" as const },
+  { period: 50, key: "ma50" as const },
+  { period: 100, key: "ma100" as const },
+  { period: 200, key: "ma200" as const },
+];
+
+function computeMaValuesFromClosedBars(barList: Bar[], currentIndex: number): MaValues {
+  const result: MaValues = {
+    ma25: 0,
+    ma50: 0,
+    ma100: 0,
+    ma200: 0,
+    ma99: null,
+    ma1000: null,
+  };
+
+  for (const { period, key } of MA_PERIOD_LIST) {
+    if (currentIndex + 1 < period) continue;
+
+    let sum = 0;
+    const startInclusive = currentIndex - period + 1;
+
+    for (let i = startInclusive; i <= currentIndex; i++) {
+      sum += barList[i].close;
+    }
+
+    result[key] = sum / period;
+  }
+
+  return result;
+}
 
 const ZERO_COMMISSION: CommissionConfig = {
   makerRate: 0,
@@ -75,6 +152,15 @@ export class StrategyRuntimeContext implements TradingEnv {
     lsr: [],
   };
 
+  private readonly timeframeStoreByRes = new Map<string, TimeframeStore>();
+
+  private readonly maValuesByResolution = new Map<
+    string,
+    Map<number, MaValues>
+  >();
+  private readonly volume24hByResolution = new Map<string, Map<number, number>>();
+  private mainResolution: string | null = null;
+
   constructor(initialBalance: number, options?: BacktestContextOptions) {
     this.balance = initialBalance;
     this.commission = options?.commission ?? ZERO_COMMISSION;
@@ -82,25 +168,65 @@ export class StrategyRuntimeContext implements TradingEnv {
     this.params = options?.params ?? {};
     this.rawConfig = options?.rawConfig ?? {};
     this.auxSeriesData = options?.auxSeriesData ?? EMPTY_AUX_SERIES;
+
+    for (const data of options?.timeframeDataList ?? []) {
+      this.timeframeStoreByRes.set(data.resolution, createTimeframeStore(data));
+    }
   }
 
   setStrategy(strategy: Strategy): void {
     this.strategy = strategy;
   }
 
-  openLong(size: number, options?: PositionOptions): void {
-    if (this.positionById.size > 0) {
-      throw new Error("Cannot open long: position already open");
+  setMainResolution(resolution: string): void {
+    this.mainResolution = resolution;
+  }
+
+  setMaValuesForResolution(
+    resolution: string,
+    mapByTime: Map<number, MaValues>,
+  ): void {
+    this.maValuesByResolution.set(resolution, mapByTime);
+  }
+
+  setVolume24hForResolution(
+    resolution: string,
+    mapByTime: Map<number, number>,
+  ): void {
+    this.volume24hByResolution.set(resolution, mapByTime);
+  }
+
+  getVolume24h(resolution?: string): number | null {
+    const res = resolution ?? this.mainResolution;
+
+    if (!res) return null;
+
+    const map = this.volume24hByResolution.get(res);
+
+    if (!map) return null;
+
+    if (res === this.mainResolution) {
+      if (!this.currentBar) return null;
+
+      return map.get(this.currentBar.time) ?? null;
     }
 
+    const store = this.timeframeStoreByRes.get(res);
+
+    if (!store || store.currentIndex < 0) return null;
+
+    const bar = store.barList[store.currentIndex];
+
+    if (!bar) return null;
+
+    return map.get(bar.time) ?? null;
+  }
+
+  openLong(size: number, options?: PositionOptions): void {
     this.openPositionAtMarket("long", size, options);
   }
 
   openShort(size: number, options?: PositionOptions): void {
-    if (this.positionById.size > 0) {
-      throw new Error("Cannot open short: position already open");
-    }
-
     this.openPositionAtMarket("short", size, options);
   }
 
@@ -214,24 +340,35 @@ export class StrategyRuntimeContext implements TradingEnv {
     return this.currentBar;
   }
 
-  getHistory(count: number): Bar[] {
-    return this.barHistory.slice(-count);
+  getHistory(count: number, resolution?: string): Bar[] {
+    if (resolution === undefined) {
+      return this.barHistory.slice(-count);
+    }
+
+    const store = this.requireTimeframeStore(resolution);
+
+    if (store.currentIndex < 0 || count <= 0) return [];
+
+    const endExclusive = store.currentIndex + 1;
+    const startInclusive = Math.max(0, endExclusive - count);
+
+    return store.barList.slice(startInclusive, endExclusive);
   }
 
-  getOiClose(): number | null {
-    return this.lookupAuxOnCurrentBar("oi");
+  getOiClose(resolution?: string): number | null {
+    return this.lookupAuxForResolution("oi", resolution);
   }
 
-  getLiqLongUsd(): number | null {
-    return this.lookupAuxOnCurrentBar("liqLong");
+  getLiqLongUsd(resolution?: string): number | null {
+    return this.lookupAuxForResolution("liqLong", resolution);
   }
 
-  getLiqShortUsd(): number | null {
-    return this.lookupAuxOnCurrentBar("liqShort");
+  getLiqShortUsd(resolution?: string): number | null {
+    return this.lookupAuxForResolution("liqShort", resolution);
   }
 
-  getLongShortRatio(): number | null {
-    return this.lookupAuxOnCurrentBar("lsr");
+  getLongShortRatio(resolution?: string): number | null {
+    return this.lookupAuxForResolution("lsr", resolution);
   }
 
   getCurrentFundingRate(): number | null {
@@ -272,8 +409,56 @@ export class StrategyRuntimeContext implements TradingEnv {
     return this.fundingRateList.slice(startIdx, endIdx + 1).map((f) => f.rate);
   }
 
-  getAuxHistory(series: AuxSeriesKind, count: number): Array<number | null> {
-    return this.auxHistoryByKind[series].slice(-count);
+  getAuxHistory(series: AuxSeriesKind, count: number, resolution?: string): Array<number | null> {
+    if (resolution === undefined) {
+      return this.auxHistoryByKind[series].slice(-count);
+    }
+
+    const store = this.requireTimeframeStore(resolution);
+
+    return store.auxHistoryByKind[series].slice(-count);
+  }
+
+  getMaValues(resolution: string): MaValues {
+    const injectedMap = this.maValuesByResolution.get(resolution);
+
+    if (injectedMap) {
+      if (resolution === this.mainResolution) {
+        if (!this.currentBar) return { ...ZERO_MA_VALUES };
+
+        const injected = injectedMap.get(this.currentBar.time);
+
+        if (injected) return injected;
+      } else {
+        const store = this.timeframeStoreByRes.get(resolution);
+
+        if (store && store.currentIndex >= 0) {
+          const bar = store.barList[store.currentIndex];
+
+          if (bar) {
+            const injected = injectedMap.get(bar.time);
+
+            if (injected) return injected;
+          }
+        }
+      }
+    }
+
+    const store = this.timeframeStoreByRes.get(resolution);
+
+    if (!store || store.currentIndex < 0) {
+      return { ...ZERO_MA_VALUES };
+    }
+
+    if (store.maCacheIndex === store.currentIndex && store.maCacheValue) {
+      return store.maCacheValue;
+    }
+
+    const computed = computeMaValuesFromClosedBars(store.barList, store.currentIndex);
+    store.maCacheIndex = store.currentIndex;
+    store.maCacheValue = computed;
+
+    return computed;
   }
 
   getParam<T extends ParamValue = ParamValue>(key: string, defaultValue: T): T {
@@ -308,6 +493,8 @@ export class StrategyRuntimeContext implements TradingEnv {
     this.currentBarIndex++;
     this.currentBar = bar;
 
+    this.advanceTimeframeStores(bar.time);
+
     if (this.positionById.size > 0) {
       this.updateRunningBest(bar);
       this.checkStopLoss(bar);
@@ -321,6 +508,26 @@ export class StrategyRuntimeContext implements TradingEnv {
       timestamp: bar.time,
       balance: this.getEffectiveBalance(),
     });
+  }
+
+  private advanceTimeframeStores(mainBarTime: number): void {
+    for (const store of this.timeframeStoreByRes.values()) {
+      while (
+        store.currentIndex + 1 < store.barList.length &&
+        store.barList[store.currentIndex + 1].time + store.durationMs <= mainBarTime
+      ) {
+        store.currentIndex++;
+        store.maCacheIndex = -2;
+        store.maCacheValue = null;
+
+        const bar = store.barList[store.currentIndex];
+
+        for (const kind of AUX_KIND_LIST) {
+          const value = getAuxMapFor(store.auxSeriesData, kind).get(bar.time);
+          store.auxHistoryByKind[kind].push(value === undefined ? null : value);
+        }
+      }
+    }
   }
 
   forceCloseAll(): void {
@@ -360,6 +567,33 @@ export class StrategyRuntimeContext implements TradingEnv {
     const value = this.getAuxMapByKind(kind).get(this.currentBar.time);
 
     return value === undefined ? null : value;
+  }
+
+  private lookupAuxForResolution(kind: AuxSeriesKind, resolution?: string): number | null {
+    if (resolution === undefined) {
+      return this.lookupAuxOnCurrentBar(kind);
+    }
+
+    const store = this.requireTimeframeStore(resolution);
+
+    if (store.currentIndex < 0) return null;
+
+    const bar = store.barList[store.currentIndex];
+    const value = getAuxMapFor(store.auxSeriesData, kind).get(bar.time);
+
+    return value === undefined ? null : value;
+  }
+
+  private requireTimeframeStore(resolution: string): TimeframeStore {
+    const store = this.timeframeStoreByRes.get(resolution);
+
+    if (!store) {
+      throw new Error(
+        `Timeframe "${resolution}" is not loaded. Declare it in Strategy.requiredTimeframes.`,
+      );
+    }
+
+    return store;
   }
 
   private pushAuxHistoryFor(timeMs: number): void {

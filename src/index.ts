@@ -8,10 +8,12 @@ export type {
   BacktestMetrics,
   Bar,
   CommissionConfig,
+  CreateTradingEnvOptions,
   EquityPoint,
   FilledOrder,
   FundingRate,
   MaValues,
+  ParamsValidationResult,
   ParamValue,
   PendingOrder,
   PeriodBreakdown,
@@ -20,6 +22,7 @@ export type {
   Position,
   PositionOptions,
   Strategy,
+  TimeframeData,
   Trade,
   TradingEnv,
 } from "./types";
@@ -27,4 +30,4 @@ export type {
 export type { StrategySpec, TypedTradingEnv } from "./define-strategy";
 export { defineStrategy } from "./define-strategy";
 
-export const API_VERSION = "1.0.0";
+export const API_VERSION = "1.6.0";

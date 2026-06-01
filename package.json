@@ -1,6 +1,6 @@
 {
   "name": "@solncebro/strategy-player-sdk",
-  "version": "1.0.0",
+  "version": "1.6.0",
   "private": true,
   "description": "Stable contract between strategy-player backtest engine and external strategy repositories. Source-of-truth for TradingEnv types and runtime behavior.",
   "main": "dist/index.js",
@@ -29,6 +29,7 @@
   "scripts": {
     "build": "tsc",
     "lint": "tsc --noEmit",
+    "prepublishOnly": "yarn build",
     "test": "vitest run",
     "test:watch": "vitest"
   },
