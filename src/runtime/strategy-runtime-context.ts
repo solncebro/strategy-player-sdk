@@ -121,6 +121,7 @@ export class StrategyRuntimeContext implements TradingEnv {
   private positionById = new Map<string, Position>();
   private nextPositionId = 1;
   private commissionByPositionId = new Map<string, number>();
+  private displayByPositionId = new Map<string, Record<string, unknown>>();
   private fundingByPositionId = new Map<string, number>();
 
   private balance: number;
@@ -138,6 +139,7 @@ export class StrategyRuntimeContext implements TradingEnv {
 
   private readonly fundingRateList: FundingRate[];
   private fundingIndex = 0;
+  private readonly applyFundingCost: boolean;
 
   private readonly params: Record<string, ParamValue>;
   private readonly rawConfig: Record<string, unknown>;
@@ -165,6 +167,7 @@ export class StrategyRuntimeContext implements TradingEnv {
     this.balance = initialBalance;
     this.commission = options?.commission ?? ZERO_COMMISSION;
     this.fundingRateList = options?.fundingRateList ?? [];
+    this.applyFundingCost = options?.applyFundingCost ?? true;
     this.params = options?.params ?? {};
     this.rawConfig = options?.rawConfig ?? {};
     this.auxSeriesData = options?.auxSeriesData ?? EMPTY_AUX_SERIES;
@@ -485,6 +488,10 @@ export class StrategyRuntimeContext implements TradingEnv {
     if (position) position.tag = tag;
   }
 
+  setPositionDisplay(positionId: string, data: Record<string, unknown>): void {
+    this.displayByPositionId.set(positionId, data);
+  }
+
   processBar(bar: Bar, maValues?: MaValues): void {
     if (this.currentBar) {
       this.barHistory.push(this.currentBar);
@@ -759,6 +766,7 @@ export class StrategyRuntimeContext implements TradingEnv {
   }
 
   private applyFunding(bar: Bar): void {
+    if (!this.applyFundingCost) return;
     if (this.positionById.size === 0 || this.fundingRateList.length === 0) return;
 
     while (
@@ -848,7 +856,7 @@ export class StrategyRuntimeContext implements TradingEnv {
     const positionFunding = this.fundingByPositionId.get(positionId) ?? 0;
 
     const pnl = this.calcPnl(position, exitPrice);
-    const pnlPercent = (pnl / (position.entryPrice * position.size)) * 100;
+    const pnlPercent = (pnl / position.size) * 100;
 
     this.tradeList.push({
       positionId,
@@ -867,12 +875,14 @@ export class StrategyRuntimeContext implements TradingEnv {
       commission: totalPositionCommission,
       funding: positionFunding,
       netPnl: pnl - totalPositionCommission + positionFunding,
+      display: this.displayByPositionId.get(positionId),
     });
 
     this.balance += pnl;
     this.positionById.delete(positionId);
     this.commissionByPositionId.delete(positionId);
     this.fundingByPositionId.delete(positionId);
+    this.displayByPositionId.delete(positionId);
   }
 
   private getEffectiveBalance(): number {

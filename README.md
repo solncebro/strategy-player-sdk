@@ -7,7 +7,7 @@ Stable contract between [strategy-player](https://github.com/solncebro/strategy-
 ## Install
 
 ```bash
-yarn add git+ssh://git@github.com:solncebro/strategy-player-sdk.git#v1.6.0
+yarn add git+ssh://git@github.com:solncebro/strategy-player-sdk.git#v1.8.0
 ```
 
 For local development (when working on this SDK):
@@ -58,7 +58,8 @@ Compile your strategy with `tsc` (or via esbuild bundling, which the player does
 - **`TradingEnv`** — the interface every strategy interacts with. Methods for opening/closing positions, placing limit orders, reading history and aux series, configuring stop loss, emitting events, and querying parameters. See `src/types.ts`.
 - **`Strategy`** — the contract your default export must satisfy.
 - **`defineStrategy<TParams>(spec)`** — type-safe declarative helper. Narrows `env.getParam("key", default)` to the parameter's actual type.
-- **`Bar`, `MaValues`, `Position`, `FilledOrder`, `PendingOrder`, `Trade`, `EquityPoint`, `BacktestEvent`** and other domain types.
+- **`Bar`, `MaValues`, `Position`, `FilledOrder`, `PendingOrder`, `Trade`, `EquityPoint`, `BacktestEvent`, `BacktestColumnSpec`, `BacktestTooltip`** and other domain types.
+- **`Strategy.backtestColumns`** — optional extra columns for the backtest trades table; values via `env.setPositionDisplay()` → `Trade.display`.
 - **`API_VERSION`** — the SDK version your bundle was built against.
 
 ## Subpath exports
@@ -101,4 +102,4 @@ describe("my strategy", () => {
 
 ## Versioning
 
-Current release is `v1.6.0`. Future `v1.x` releases add optional methods/fields only — never break or remove. Breaking changes ship as `v2.0.0` with a migration guide. See [`CHANGELOG.md`](./CHANGELOG.md).
+Current release is `v1.8.0`. Future `v1.x` releases add optional methods/fields only — never break or remove. Breaking changes ship as `v2.0.0` with a migration guide. See [`CHANGELOG.md`](./CHANGELOG.md).

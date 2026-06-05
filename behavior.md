@@ -1,7 +1,7 @@
 # strategy-player-sdk — Behavior Specification
 
 > **Audience:** authors of trading strategies who write code against `strategy-player-sdk`.
-> **Status:** Canonical. Pinned to `v1.6.0`. Additive evolution only — see CHANGELOG.md.
+> **Status:** Canonical. Pinned to `v1.8.0`. Additive evolution only — see CHANGELOG.md.
 >
 > Read this together with the TypeScript types in `src/types.ts` (or `dist/index.d.ts` after `yarn install`). Types alone tell you the **shape** of the API; this document tells you the **runtime semantics**.
 
@@ -134,6 +134,12 @@ Each `Trade` records its **total** commission (entry + exit) in `Trade.commissio
 netPnl = pnl - commission + funding
 ```
 
+`Trade.pnlPercent` is the **price-move percent** of the position, independent of notional size:
+```
+pnlPercent = (pnl / size) * 100        // ≈ (exit - entry) / entry * 100 for long
+```
+It is comparable across symbols of any price (it is **not** divided by `entryPrice` a second time, and **not** a ROI-of-deposit figure).
+
 ---
 
 ## 6. Funding model
@@ -149,7 +155,9 @@ So **positive funding rate ⇒ longs pay, shorts receive**. Negative rate is the
 
 A funding event at time `T` is applied on the first bar with `bar.time ≥ T`, and only against positions that were opened before the event (`fundingRate.time ≥ position.entryTime`). Funding is then accumulated into `Trade.funding` and `balance`.
 
-If `useFunding` is `false` (or `fundingRateList` is empty), funding is a no-op.
+If `fundingRateList` is empty, funding is a no-op.
+
+**Reading funding vs charging it (`applyFundingCost`, v1.7).** `getCurrentFundingRate()` / `getRecentFundingRates(N)` read from `fundingRateList` regardless of any flag — a funding-driven strategy always needs this data to produce signals. The separate `BacktestContextOptions.applyFundingCost` flag (default `true`) controls only whether the funding **cost** is deducted from position PnL inside `applyFunding`. The player wires `applyFundingCost` to the run's `useFunding` toggle, so turning funding "off" removes the cost from PnL but still feeds the strategy its funding rates (it keeps trading).
 
 Source of funding rates in the backtest engine: PostgreSQL `funding_research.funding`. In live: exchange WebSocket / REST.
 
@@ -304,6 +312,7 @@ Note the **subtle difference**: `getHistory(N)` (main TF) excludes the current b
 | `closeAllPositions(exitReason?)` | void | closes every open, taker |
 | `setStopLoss(idOrPrice, price?)` | void | updates SL on a position |
 | `setPositionTag(positionId, tag)` | void | annotates position; tag persists into the resulting `Trade` |
+| `setPositionDisplay(positionId, data)` | void | display-ready values for `Strategy.backtestColumns`; persists into `Trade.display` on close (v1.8) |
 | `getBalance()` | number | realized balance (no unrealized PnL) |
 | `getBarIndex()` | number | 0-indexed; -1 before first bar |
 | `getCurrentBar()` | `Bar` | throws if no current bar yet |
@@ -417,9 +426,36 @@ Higher-timeframe references — added in `v1.1` (see §11.1). Params validation 
 
 ---
 
+## 18. Backtest result columns — v1.8
+
+A strategy can declare extra columns for the player's trades table and supply per-trade values, so strategy-specific columns live in the strategy (the runtime can't render UI):
+
+```typescript
+backtestColumns: [
+  { key: "funding", label: "Funding", align: "right" },
+  { key: "range", label: "Range", align: "left", tooltipKey: "filters" },
+];
+```
+
+Per trade, the strategy attaches **display-ready** values (already-formatted strings) keyed by column `key`; a `tooltipKey` cell reads a `BacktestTooltip` (`{ rows: [{ label, value, ranges: [{ text, matched }] }] }`):
+
+```typescript
+env.openLong(size);
+const pos = env.getPositionList()[0];
+env.setPositionDisplay?.(pos.id, {
+  funding: "-0.45%",
+  range: "0.1%–0.5%",
+  filters: { rows: [{ label: "MA5m200", value: "+12.3%", ranges: [{ text: "6%…50%", matched: true }] }] },
+});
+```
+
+These ride into `Trade.display` on close (exactly like `setPositionTag` → `Trade.tag`). The player renders columns generically from the schema + `Trade.display`; it does no formatting or decoding. Strategies that declare nothing show only the generic base columns. The strategy owns all formatting (percent, K/M/B, matched-range detection).
+
+---
+
 ## 17. Versioning promise
 
-`v1.0.0` froze the surface; `v1.1.0` MTF; `v1.2.0` params validation; `v1.3.0` custom trading env adapter; `v1.4.0` funding history in adapter options; `v1.5.0` multi-position market opens; `v1.6.0` `allowedResolutions`. Future `v1.x` releases:
+`v1.0.0` froze the surface; `v1.1.0` MTF; `v1.2.0` params validation; `v1.3.0` custom trading env adapter; `v1.4.0` funding history in adapter options; `v1.5.0` multi-position market opens; `v1.6.0` `allowedResolutions`; `v1.7.0` `totalPnlPercent` + `applyFundingCost` + `pnlPercent` formula bugfix; `v1.8.0` strategy-declared backtest columns (`Strategy.backtestColumns` + `Trade.display` + `setPositionDisplay`). Future `v1.x` releases:
 - **may** add new optional methods to `TradingEnv` (`method?(): T | null`),
 - **may** add new optional parameters to existing `TradingEnv` methods (`foo(a, b?: string)`),
 - **may** add new optional fields to existing types (`{ existing: ..., newField?: ... }`),

@@ -17,6 +17,32 @@ function makeBar(close: number, time = 1000000, high?: number, low?: number): Ba
 }
 
 describe("MockTradingEnv", () => {
+  it("carries setPositionDisplay data into the closed Trade.display", () => {
+    const strategy = defineStrategy({
+      name: "display",
+      version: "1.0",
+      params: {},
+      onBar(_bar, _ma, env) {
+        if (env.getPositionList().length === 0) {
+          env.openLong(100);
+          const pos = env.getPositionList()[0];
+          env.setPositionDisplay?.(pos.id, { range: "0.1%–0.5%", period: "4h" });
+        } else {
+          env.closeAllPositions();
+        }
+      },
+    });
+
+    const mock = new MockTradingEnv(strategy);
+    mock.feedBar(makeBar(100), ZERO_MA);
+    mock.feedBar(makeBar(110), ZERO_MA);
+
+    const trades = mock.getTradeList();
+
+    expect(trades).toHaveLength(1);
+    expect(trades[0].display).toEqual({ range: "0.1%–0.5%", period: "4h" });
+  });
+
   it("calls init exactly once before first onBar", () => {
     const calls: string[] = [];
 

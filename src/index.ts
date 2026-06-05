@@ -1,11 +1,14 @@
 export type {
   AuxSeriesData,
   AuxSeriesKind,
+  BacktestColumnSpec,
   BacktestConfig,
   BacktestContextOptions,
   BacktestContextResult,
   BacktestEvent,
   BacktestMetrics,
+  BacktestTooltip,
+  BacktestTooltipRow,
   Bar,
   CommissionConfig,
   CreateTradingEnvOptions,
@@ -30,4 +33,4 @@ export type {
 export type { StrategySpec, TypedTradingEnv } from "./define-strategy";
 export { defineStrategy } from "./define-strategy";
 
-export const API_VERSION = "1.6.0";
+export const API_VERSION = "1.8.0";

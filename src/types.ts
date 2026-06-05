@@ -80,6 +80,34 @@ export interface Trade {
   commission: number;
   funding: number;
   netPnl: number;
+  /**
+   * Strategy-provided, display-ready values for the strategy's declared
+   * `backtestColumns` (set via `setPositionDisplay`). Keys match column `key`
+   * / `tooltipKey`. Values are already-formatted strings, or a
+   * `BacktestTooltip` for tooltip cells.
+   */
+  display?: Record<string, unknown>;
+}
+
+/** A strategy-declared extra column in the backtest results table. */
+export interface BacktestColumnSpec {
+  key: string;
+  label: string;
+  align?: "left" | "right" | "center";
+  /** If set, the cell shows an info marker; `Trade.display[tooltipKey]` holds a `BacktestTooltip`. */
+  tooltipKey?: string;
+}
+
+export interface BacktestTooltipRow {
+  label: string;
+  /** Already-formatted actual value at the trade moment (e.g. "+12.3%", "2.0B"). */
+  value: string;
+  /** Configured ranges (already formatted); `matched` marks the one the value fell into. */
+  ranges: { text: string; matched: boolean }[];
+}
+
+export interface BacktestTooltip {
+  rows: BacktestTooltipRow[];
 }
 
 export type AuxSeriesKind = "oi" | "liqLong" | "liqShort" | "lsr";
@@ -121,6 +149,12 @@ export interface BacktestContextOptions {
   rawConfig?: Record<string, unknown>;
   auxSeriesData?: AuxSeriesData;
   timeframeDataList?: TimeframeData[];
+  /**
+   * When false, funding rates are still readable by the strategy
+   * (getCurrentFundingRate / getRecentFundingRates) but their cost is NOT
+   * charged to position PnL. Defaults to true (cost applied).
+   */
+  applyFundingCost?: boolean;
 }
 
 export interface BacktestContextResult {
@@ -141,6 +175,7 @@ export interface BacktestConfig {
 
 export interface BacktestMetrics {
   totalPnl: number;
+  totalPnlPercent: number;
   totalCommission: number;
   totalFunding: number;
   totalNetPnl: number;
@@ -192,6 +227,11 @@ export interface TradingEnv {
   closeAllPositions(exitReason?: string): void;
   setStopLoss(positionIdOrPrice: string | number, price?: number): void;
   setPositionTag(positionId: string, tag: string): void;
+  /**
+   * Attach display-ready values for the strategy's `backtestColumns` to a
+   * position; carried into `Trade.display` on close (mirrors `setPositionTag`).
+   */
+  setPositionDisplay?(positionId: string, data: Record<string, unknown>): void;
 
   getBalance(): number;
   getBarIndex(): number;
@@ -232,6 +272,12 @@ export interface Strategy {
   params: Record<string, ParamValue>;
   allowedResolutions?: string[];
   requiredTimeframes?: Record<string, number>;
+  /**
+   * Extra columns this strategy contributes to the backtest results table.
+   * Values come from each trade's `display` (set via `setPositionDisplay`).
+   * Omitted/empty → no extra columns (only the generic base columns show).
+   */
+  backtestColumns?: BacktestColumnSpec[];
   validateParams?(parsed: unknown): ParamsValidationResult;
   createTradingEnv?(innerEnv: TradingEnv, options: CreateTradingEnvOptions): TradingEnv;
   init?(env: TradingEnv): void;

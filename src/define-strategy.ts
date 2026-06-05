@@ -1,4 +1,5 @@
 import type {
+  BacktestColumnSpec,
   Bar,
   CreateTradingEnvOptions,
   FilledOrder,
@@ -20,6 +21,7 @@ export interface StrategySpec<TParams extends Record<string, ParamValue>> {
   params: TParams;
   allowedResolutions?: string[];
   requiredTimeframes?: Record<string, number>;
+  backtestColumns?: BacktestColumnSpec[];
   validateParams?(parsed: unknown): ParamsValidationResult;
   createTradingEnv?(innerEnv: TradingEnv, options: CreateTradingEnvOptions): TradingEnv;
   init?(env: TypedTradingEnv<TParams>): void;

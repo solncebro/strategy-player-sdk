@@ -6,6 +6,57 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [Unreleased]
+
+---
+
+## [1.8.0] — 2026-06-06
+
+Let a strategy declare its own extra columns for the backtest results table and provide per-trade display-ready values — so strategy-specific columns are abstracted into the strategy instead of hardcoded in the player UI.
+
+### Added
+
+- `Strategy.backtestColumns?: BacktestColumnSpec[]` — declares extra columns (`{ key, label, align?, tooltipKey? }`) the player adds to the trades table. Omitted/empty → only generic base columns.
+- `Trade.display?: Record<string, unknown>` — per-trade, display-ready values for those columns (already-formatted strings, or a `BacktestTooltip` for tooltip cells).
+- `TradingEnv.setPositionDisplay?(positionId, data)` — attach display data to a position; carried into `Trade.display` on close (mirrors `setPositionTag` → `Trade.tag`).
+- Types `BacktestColumnSpec`, `BacktestTooltip`, `BacktestTooltipRow`.
+- `API_VERSION` bumped from `"1.7.0"` to `"1.8.0"`.
+
+### Why
+
+Funding-specific columns (funding rate / period / range / min + MA-filter tooltip) were hardcoded in the player's `TradeTable`. With this, each strategy declares + formats its own columns; the player renders them generically. The runtime can't render React (sandbox), so the strategy ships a serializable schema + display-ready strings.
+
+### Compatibility
+
+- All additive/optional. Strategies without `backtestColumns` / `setPositionDisplay` behave exactly as before (no extra columns).
+
+---
+
+## [1.7.0] — Unreleased
+
+Fix the `Trade.pnlPercent` formula, add `BacktestMetrics.totalPnlPercent`, and decouple reading funding rates from charging their cost via `applyFundingCost`.
+
+### Added
+
+- `BacktestMetrics.totalPnlPercent: number` — sum of per-trade `pnlPercent` (price-move %). Filled by the player's `calculateMetrics`.
+- `BacktestContextOptions.applyFundingCost?: boolean` (default `true`) — when `false`, funding rates remain readable by the strategy (`getCurrentFundingRate` / `getRecentFundingRates`) but their cost is **not** deducted from position PnL.
+- `API_VERSION` bumped from `"1.6.0"` to `"1.7.0"`.
+
+### Fixed
+
+- `Trade.pnlPercent` was `pnl / (entryPrice * size) * 100`, which is dimensionally wrong (an extra division by `entryPrice`) and produced values that varied wildly by symbol price and corrupted the Sharpe ratio. Now `pnl / size * 100` — the price-move percent (`≈ (exit - entry) / entry * 100` for long).
+
+### Why
+
+The platform needs a "Total PnL %" that is the sum of trade price-move percents (never ROI-of-deposit). That sum was meaningless while `pnlPercent` was wrong. Separately, funding-driven strategies need their funding rates to generate signals even when the user disables funding **cost** — previously turning funding off starved them of data and they produced zero trades.
+
+### Compatibility
+
+- `applyFundingCost` is optional and defaults to the prior behavior (cost applied).
+- `totalPnlPercent` is additive. The `pnlPercent` correction changes reported values: runs persisted before this release keep their old stored `pnlPercent`/metrics until re-run.
+
+---
+
 ## [1.6.0] — Unreleased
 
 Add `Strategy.allowedResolutions?: string[]` — a strategy may declare which main timeframes it is allowed to run on.
