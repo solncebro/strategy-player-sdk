@@ -16,6 +16,7 @@ export type {
   FilledOrder,
   FundingRate,
   MaValues,
+  OiOhlc,
   ParamsValidationResult,
   ParamValue,
   PendingOrder,

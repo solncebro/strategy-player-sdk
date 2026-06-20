@@ -10,6 +10,7 @@ import type {
   FilledOrder,
   FundingRate,
   MaValues,
+  OiOhlc,
   ParamValue,
   PendingOrder,
   Position,
@@ -35,6 +36,7 @@ interface TimeframeStore {
   durationMs: number;
   currentIndex: number;
   auxHistoryByKind: Record<AuxSeriesKind, Array<number | null>>;
+  oiOhlcHistory: Array<OiOhlc | null>;
   maCacheIndex: number;
   maCacheValue: MaValues | null;
 }
@@ -67,6 +69,7 @@ function createTimeframeStore(data: TimeframeData): TimeframeStore {
     durationMs: barDurationMs(data.resolution),
     currentIndex: -1,
     auxHistoryByKind: { oi: [], liqLong: [], liqShort: [], lsr: [] },
+    oiOhlcHistory: [],
     maCacheIndex: -2,
     maCacheValue: null,
   };
@@ -153,6 +156,8 @@ export class StrategyRuntimeContext implements TradingEnv {
     liqShort: [],
     lsr: [],
   };
+  private readonly oiOhlcHistory: Array<OiOhlc | null> = [];
+  private readonly oiOhlcByTime: Map<number, OiOhlc>;
 
   private readonly timeframeStoreByRes = new Map<string, TimeframeStore>();
 
@@ -171,6 +176,7 @@ export class StrategyRuntimeContext implements TradingEnv {
     this.params = options?.params ?? {};
     this.rawConfig = options?.rawConfig ?? {};
     this.auxSeriesData = options?.auxSeriesData ?? EMPTY_AUX_SERIES;
+    this.oiOhlcByTime = new Map(options?.auxSeriesData?.oiOhlcByTime ?? []);
 
     for (const data of options?.timeframeDataList ?? []) {
       this.timeframeStoreByRes.set(data.resolution, createTimeframeStore(data));
@@ -183,6 +189,15 @@ export class StrategyRuntimeContext implements TradingEnv {
 
   setMainResolution(resolution: string): void {
     this.mainResolution = resolution;
+  }
+
+  /**
+   * Inject one open-interest OHLC candle (coins) for a bar time. Used by live/paper
+   * runners that receive open interest incrementally per closed bar; must be called
+   * before `processBar` for that bar so `getOiOhlc()/getOiOhlcHistory()` see it.
+   */
+  setOiOhlc(time: number, oiBar: OiOhlc): void {
+    this.oiOhlcByTime.set(time, oiBar);
   }
 
   setMaValuesForResolution(
@@ -330,6 +345,12 @@ export class StrategyRuntimeContext implements TradingEnv {
     }
   }
 
+  setTakeProfit(positionId: string, price: number): void {
+    const pos = this.positionById.get(positionId);
+
+    if (pos) pos.takeProfit = price;
+  }
+
   getBalance(): number {
     return this.balance;
   }
@@ -360,6 +381,31 @@ export class StrategyRuntimeContext implements TradingEnv {
 
   getOiClose(resolution?: string): number | null {
     return this.lookupAuxForResolution("oi", resolution);
+  }
+
+  getOiOhlc(resolution?: string): OiOhlc | null {
+    if (resolution === undefined) {
+      if (!this.currentBar) return null;
+      return this.oiOhlcByTime.get(this.currentBar.time) ?? null;
+    }
+
+    const store = this.requireTimeframeStore(resolution);
+
+    if (store.currentIndex < 0) return null;
+
+    const bar = store.barList[store.currentIndex];
+
+    return store.auxSeriesData.oiOhlcByTime?.get(bar.time) ?? null;
+  }
+
+  getOiOhlcHistory(count: number, resolution?: string): Array<OiOhlc | null> {
+    if (resolution === undefined) {
+      return this.oiOhlcHistory.slice(-count);
+    }
+
+    const store = this.requireTimeframeStore(resolution);
+
+    return store.oiOhlcHistory.slice(-count);
   }
 
   getLiqLongUsd(resolution?: string): number | null {
@@ -533,6 +579,7 @@ export class StrategyRuntimeContext implements TradingEnv {
           const value = getAuxMapFor(store.auxSeriesData, kind).get(bar.time);
           store.auxHistoryByKind[kind].push(value === undefined ? null : value);
         }
+        store.oiOhlcHistory.push(store.auxSeriesData.oiOhlcByTime?.get(bar.time) ?? null);
       }
     }
   }
@@ -608,6 +655,7 @@ export class StrategyRuntimeContext implements TradingEnv {
       const value = this.getAuxMapByKind(kind).get(timeMs);
       this.auxHistoryByKind[kind].push(value === undefined ? null : value);
     }
+    this.oiOhlcHistory.push(this.oiOhlcByTime.get(timeMs) ?? null);
   }
 
   private getPositionById(positionId: string): Position | null {

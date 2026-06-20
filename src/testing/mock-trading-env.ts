@@ -69,6 +69,20 @@ export class MockTradingEnv {
     this.runtime.forceCloseAll();
   }
 
+  // Forwards an external user command (live/paper runners) to the strategy. The strategy is expected
+  // to only mark snapshot-visible state and act on it in the next onBar, keeping replays
+  // deterministic when the same commands are re-sent at the same bar boundaries.
+  sendCommand(command: Record<string, unknown>): void {
+    if (!this.strategy.onExternalCommand) return;
+
+    if (!this.initialized) {
+      this.strategy.init?.(this.runtime);
+      this.initialized = true;
+    }
+
+    this.strategy.onExternalCommand(command, this.runtime);
+  }
+
   getRuntime(): StrategyRuntimeContext {
     return this.runtime;
   }

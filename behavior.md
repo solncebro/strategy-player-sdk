@@ -290,6 +290,7 @@ Note the **subtle difference**: `getHistory(N)` (main TF) excludes the current b
 - `closePosition(positionId?)` without an id closes the first open position (insertion order). With an id, closes that specific position.
 - `closeAllPositions(exitReason?)` closes every open position at the current bar's close with taker commission.
 - `setStopLoss(positionId, price)` updates the SL on a specific position. `setStopLoss(price)` (single argument number) targets the first open position — kept for backward-compat with single-position strategies.
+- `setTakeProfit?(positionId, price)` sets/replaces the take-profit on an existing position — same semantics as passing `PositionOptions.takeProfit` at open: checked on the next bar's `processBar` before `onBar`, fills at the exact TP price with taker commission, exitReason `"take_profit"`, and (like any TP fill) does NOT trigger `onOrderFill` — reconcile via `getPositionList()` in `onBar`. Declared optional so strategies can feature-detect it on older runtimes (`env.setTakeProfit?.(id, price)`). Unknown `positionId` is a no-op.
 
 ---
 
@@ -311,6 +312,7 @@ Note the **subtle difference**: `getHistory(N)` (main TF) excludes the current b
 | `closePosition(positionId?, exitReason?)` | void | closes at `currentBar.close`, taker |
 | `closeAllPositions(exitReason?)` | void | closes every open, taker |
 | `setStopLoss(idOrPrice, price?)` | void | updates SL on a position |
+| `setTakeProfit(positionId, price)` | void | sets/replaces TP on a position; optional method, feature-detect on older runtimes |
 | `setPositionTag(positionId, tag)` | void | annotates position; tag persists into the resulting `Trade` |
 | `setPositionDisplay(positionId, data)` | void | display-ready values for `Strategy.backtestColumns`; persists into `Trade.display` on close (v1.8) |
 | `getBalance()` | number | realized balance (no unrealized PnL) |
@@ -423,6 +425,22 @@ The strategy itself **does not know which environment it runs in**. Both adapter
 These are **possible additive extensions** for `v1.x` (or breaking-change candidates for `v2.x`). Open a SDK PR with a concrete strategy use case if you need them.
 
 Higher-timeframe references — added in `v1.1` (see §11.1). Params validation — added in `v1.2` (see §14). Custom trading env adapter — added in `v1.3` (see §15).
+
+---
+
+## 19. Live module (`@solncebro/strategy-player-sdk/live`)
+
+Runs the SAME strategy code outside the backtest player:
+
+- **`PaperStrategyRunner`** — the exact backtest runtime fed with live closed bars ("real-time backtest"). Fills/SL/TP/commission semantics are identical to the player. `feedClosedBar(bar, maValues?)` + `drainNewEventList()` for incremental event forwarding (notifications, journaling).
+- **`LiveStrategyRunner`** — executes the strategy against a real exchange through a **`LiveExecutionPort`** the host bot implements (place/cancel entry limit, replace/cancel stop-loss & take-profit, market close + fill notifications back into the runner). One runner = one symbol+direction.
+  - **Desired-state sync**: the strategy's synchronous TradingEnv calls mutate local books; after every bar / fill handler the runner diffs the desired state against the exchange-known state and issues port operations (cancels → entry placements → market closes → protective replaces).
+  - **Position aggregation**: the strategy holds N small positions (one per limit fill, as in the player) while the exchange holds ONE netted position — protective orders sync as a single exchange order for the total size (the strategy must keep one uniform protective price; the last `setStopLoss`/`setTakeProfit` price wins).
+  - **TP semantics mirror the player**: `handleTakeProfitFilled` does NOT call `onOrderFill`; the strategy reconciles via `getPositionList()` on the next bar.
+  - **Catch-up mode** (`startCatchUp`/`completeCatchUp`): replay history through the strategy without touching the exchange, then sync only the final desired state — for manual late entries and restart recovery.
+  - **Snapshot/restore** (`getSnapshot`/`restoreSnapshot`): persists the books + the optional `Strategy.getStateSnapshot()`/`restoreStateSnapshot()` payload so a host can resume mid-setup after a restart.
+  - **Market entries in live ARE supported**: `openLong`/`openShort` record a desired market entry that the post-bar sync executes through the optional `LiveExecutionPort.openPositionMarket` (firing `onOrderFill` with `type: "market"`, emitting `market_entry_filled`). If the host's port does **not** implement `openPositionMarket`, `openLong`/`openShort` **throw immediately** — the entry is never silently dropped. Strategies that only use `placeLimitOrder` never touch this path.
+  - Unsupported in live: MTF history (`getHistory(N, resolution)` returns `[]`), aux series (null), funding (null).
 
 ---
 
