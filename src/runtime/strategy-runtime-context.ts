@@ -538,7 +538,10 @@ export class StrategyRuntimeContext implements TradingEnv {
     this.displayByPositionId.set(positionId, data);
   }
 
-  processBar(bar: Bar, maValues?: MaValues): void {
+  // `_maValues` is accepted for backward-compat with existing callers (player / MockTradingEnv /
+  // PaperStrategyRunner) but is no longer used by the runtime: the main-TF MA the strategy sees comes
+  // straight from `strategy.onBar(bar, maValues, env)`, and MTF MAs come via setMaValuesForResolution.
+  processBar(bar: Bar, _maValues?: MaValues): void {
     if (this.currentBar) {
       this.barHistory.push(this.currentBar);
       this.pushAuxHistoryFor(this.currentBar.time);
@@ -553,7 +556,7 @@ export class StrategyRuntimeContext implements TradingEnv {
       this.checkStopLoss(bar);
     }
 
-    this.checkPendingOrders(bar, maValues);
+    this.checkPendingOrders(bar);
     this.applyFunding(bar);
 
     this.equityList.push({
@@ -730,18 +733,7 @@ export class StrategyRuntimeContext implements TradingEnv {
     }
   }
 
-  private checkPendingOrders(bar: Bar, maValues?: MaValues): void {
-    if (this.strategy?.onBeforeLimitFill && maValues) {
-      const limitOrderList = this.pendingOrderList.filter((o) => o.type === "limit");
-
-      for (const _ of limitOrderList) {
-        const allowed = this.strategy.onBeforeLimitFill(maValues, this);
-
-        if (!allowed) break;
-        break;
-      }
-    }
-
+  private checkPendingOrders(bar: Bar): void {
     const filledIndexList: number[] = [];
 
     for (let i = 0; i < this.pendingOrderList.length; i++) {

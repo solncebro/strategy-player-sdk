@@ -57,9 +57,6 @@ describe("defineStrategy<TParams>", () => {
       onOrderFill() {
         /* no-op */
       },
-      onBeforeLimitFill() {
-        return true;
-      },
       onEnd() {
         /* no-op */
       },
@@ -67,7 +64,6 @@ describe("defineStrategy<TParams>", () => {
 
     expect(strategy.init).toBeDefined();
     expect(strategy.onOrderFill).toBeDefined();
-    expect(strategy.onBeforeLimitFill).toBeDefined();
     expect(strategy.onEnd).toBeDefined();
   });
 });

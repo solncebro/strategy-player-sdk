@@ -27,7 +27,6 @@ export interface StrategySpec<TParams extends Record<string, ParamValue>> {
   init?(env: TypedTradingEnv<TParams>): void;
   onBar(bar: Bar, maValues: MaValues, env: TypedTradingEnv<TParams>): void;
   onOrderFill?(order: FilledOrder, env: TypedTradingEnv<TParams>): void;
-  onBeforeLimitFill?(maValues: MaValues, env: TypedTradingEnv<TParams>): boolean;
   onEnd?(env: TypedTradingEnv<TParams>): void;
 }
 

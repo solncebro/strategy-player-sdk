@@ -326,7 +326,6 @@ export interface Strategy {
   init?(env: TradingEnv): void;
   onBar(bar: Bar, maValues: MaValues, env: TradingEnv): void;
   onOrderFill?(order: FilledOrder, env: TradingEnv): void;
-  onBeforeLimitFill?(maValues: MaValues, env: TradingEnv): boolean;
   onEnd?(env: TradingEnv): void;
   /**
    * Optional live-trading hooks (ignored by the backtest player): serialize the strategy's internal

@@ -92,33 +92,30 @@ export class LiveStrategyRunner implements TradingEnv {
   async feedClosedBar(bar: Bar, maValues?: MaValues, oiBar?: OiOhlc): Promise<void> {
     this.ensureInitialized();
 
-    if (this.currentBar) {
-      this.barHistory.push(this.currentBar);
-      this.oiHistory.push(this.currentOiBar);
+    // A bar already incorporated (time <= the last one) is skipped — no strategy run, no sync — so a
+    // host that replays missed/already-seen klines after a snapshot restore does not double-process.
+    if (!this.advanceBar(bar, maValues, oiBar)) return;
 
-      if (this.barHistory.length > this.historyLimit) {
-        this.barHistory.splice(0, this.barHistory.length - this.historyLimit);
-      }
-
-      if (this.oiHistory.length > this.historyLimit) {
-        this.oiHistory.splice(0, this.oiHistory.length - this.historyLimit);
-      }
-    }
-
-    this.currentBarIndex++;
-    this.currentBar = bar;
-    this.currentMaValues = maValues ?? null;
-    this.currentOiBar = oiBar ?? null;
-    this.updateRunningBest(bar);
     this.strategy.onBar(bar, maValues ?? ZERO_MA, this);
     await this.sync();
   }
 
   // Replay a historical closed bar to build price/open-interest history WITHOUT running the strategy
   // and WITHOUT touching the exchange — live warmup, so a fresh start does not act on signals that
-  // closed before going live.
+  // closed before going live. Idempotent by bar time (see advanceBar): replaying a bar already in the
+  // restored history is a no-op, so restore + catch-up compose without doubling history.
   catchUpBar(bar: Bar, maValues?: MaValues, oiBar?: OiOhlc): void {
     this.ensureInitialized();
+    this.advanceBar(bar, maValues, oiBar);
+  }
+
+  // Advance the rolling market context by one closed bar: push the previous bar/OI into history
+  // (trimmed to historyLimit), then set the new current bar/MA/OI and update running-best. Returns
+  // false (and does nothing) when the bar is at or before the last incorporated bar — the idempotency
+  // guard that lets snapshot-restore and catch-up compose without doubling history or drifting the
+  // bar index. Shared by feedClosedBar and catchUpBar so the two paths cannot diverge.
+  private advanceBar(bar: Bar, maValues?: MaValues, oiBar?: OiOhlc): boolean {
+    if (this.currentBar && bar.time <= this.currentBar.time) return false;
 
     if (this.currentBar) {
       this.barHistory.push(this.currentBar);
@@ -138,6 +135,8 @@ export class LiveStrategyRunner implements TradingEnv {
     this.currentMaValues = maValues ?? null;
     this.currentOiBar = oiBar ?? null;
     this.updateRunningBest(bar);
+
+    return true;
   }
 
   // Forwards an external user command (e.g. a Telegram reply) to the strategy. The strategy is
@@ -291,6 +290,11 @@ export class LiveStrategyRunner implements TradingEnv {
       lastSyncedTakeProfit: this.lastSyncedTakeProfit ? { ...this.lastSyncedTakeProfit } : null,
       nextLocalOrderNumber: this.nextLocalOrderNumber,
       nextLocalPositionNumber: this.nextLocalPositionNumber,
+      barHistory: this.barHistory.map((entry) => ({ ...entry })),
+      oiHistory: this.oiHistory.map((entry) => (entry ? { ...entry } : null)),
+      currentBar: this.currentBar ? { ...this.currentBar } : null,
+      currentMaValues: this.currentMaValues ? { ...this.currentMaValues } : null,
+      currentOiBar: this.currentOiBar ? { ...this.currentOiBar } : null,
     };
   }
 
@@ -307,6 +311,28 @@ export class LiveStrategyRunner implements TradingEnv {
     this.lastSyncedTakeProfit = snapshot.lastSyncedTakeProfit ? { ...snapshot.lastSyncedTakeProfit } : null;
     this.nextLocalOrderNumber = snapshot.nextLocalOrderNumber;
     this.nextLocalPositionNumber = snapshot.nextLocalPositionNumber;
+
+    // Bar context is optional for backward-compat: a snapshot from an older SDK omits these fields,
+    // and we then leave the rolling context empty (the host warms it up via catchUpBar, as before).
+    if (snapshot.barHistory !== undefined) {
+      this.barHistory = snapshot.barHistory.map((entry) => ({ ...entry }));
+    }
+
+    if (snapshot.oiHistory !== undefined) {
+      this.oiHistory = snapshot.oiHistory.map((entry) => (entry ? { ...entry } : null));
+    }
+
+    if (snapshot.currentBar !== undefined) {
+      this.currentBar = snapshot.currentBar ? { ...snapshot.currentBar } : null;
+    }
+
+    if (snapshot.currentMaValues !== undefined) {
+      this.currentMaValues = snapshot.currentMaValues ? { ...snapshot.currentMaValues } : null;
+    }
+
+    if (snapshot.currentOiBar !== undefined) {
+      this.currentOiBar = snapshot.currentOiBar ? { ...snapshot.currentOiBar } : null;
+    }
 
     if (snapshot.strategySnapshot && this.strategy.restoreStateSnapshot) {
       this.strategy.restoreStateSnapshot(snapshot.strategySnapshot);

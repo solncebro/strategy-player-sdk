@@ -1,4 +1,4 @@
-import type { BacktestEvent, ParamValue } from "../types";
+import type { BacktestEvent, Bar, MaValues, OiOhlc, ParamValue } from "../types";
 
 export type LiveOrderSide = "buy" | "sell";
 
@@ -120,6 +120,17 @@ export interface LiveRunnerSnapshot {
   lastSyncedTakeProfit: ProtectiveOrderSyncState | null;
   nextLocalOrderNumber: number;
   nextLocalPositionNumber: number;
+  /**
+   * Rolling market context so a restored runner can serve getHistory/getCurrentBar/getMaValues/OI
+   * immediately, without the host first replaying warm-up bars. Optional for backward-compat: a
+   * snapshot persisted by an older SDK omits these, and restoreSnapshot then leaves the context empty
+   * (the host must warm it up via catchUpBar, as before). Bounded by the runner's historyLimit.
+   */
+  barHistory?: Bar[];
+  oiHistory?: Array<OiOhlc | null>;
+  currentBar?: Bar | null;
+  currentMaValues?: MaValues | null;
+  currentOiBar?: OiOhlc | null;
 }
 
 export interface EntryOrderFilledArgs {

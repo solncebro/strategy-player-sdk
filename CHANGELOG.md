@@ -8,6 +8,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Removed
+
+- **`Strategy.onBeforeLimitFill` / `StrategySpec.onBeforeLimitFill`** — removed from the SDK contract. The documented boolean "veto" was never honored by the backtest runtime (the return value was dead code: an unconditional `break` discarded it, and the fill loop ignored it), so it misled strategy authors. The only consumer (`ma-bounce`) drives this hook inside its own coordinator, not via the SDK runtime — a pre-fill veto is a strategy-specific concern and now lives entirely in the strategy that needs it. **Breaking change** (removal of a public optional member) — requires a major version bump when released.
+
+### Added
+
+- **`LiveRunnerSnapshot` now carries rolling bar context** (`barHistory`, `oiHistory`, `currentBar`, `currentMaValues`, `currentOiBar`) so `LiveStrategyRunner.restoreSnapshot` rehydrates `getCurrentBar`/`getHistory`/`getMaValues`/OI accessors immediately after a restart — no warm-up replay required. All fields are optional: a snapshot from an older SDK restores the books only (prior behavior). Bounded by the runner's `historyLimit`.
+
+### Fixed
+
+- **Live market entries (`openLong`/`openShort`)** now match the documented contract: they execute through the optional `LiveExecutionPort.openPositionMarket`, and **throw immediately** if the port does not implement it (previously the entry was silently dropped with only a `market_entry_unsupported` event). `behavior.md` §19 corrected — market entries ARE supported in live, they do not "throw — use placeLimitOrder" as previously stated.
+- **`LiveStrategyRunner.restoreSnapshot` no longer leaves the runner in a crash-prone half-state.** Previously the snapshot dropped all bar context, so the first post-restore `getCurrentBar()` threw "No current bar" and `getHistory`/`getMaValues` silently returned empty/zero until the next bar. Bar context is now persisted and restored (see Added).
+- **`feedClosedBar`/`catchUpBar` are now idempotent by bar time** — a closed bar at or before the last incorporated bar is skipped (no strategy run, no sync, no index advance). This lets snapshot-restore and post-restart catch-up compose without doubling history or drifting `getBarIndex()`/`PendingOrder.createdAtBar`. The shared advance logic is also de-duplicated into one private `advanceBar` helper (previously copy-pasted between the two methods).
+
 ---
 
 ## [1.8.0] — 2026-06-06

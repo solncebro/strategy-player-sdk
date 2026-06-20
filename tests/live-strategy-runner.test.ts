@@ -520,4 +520,79 @@ describe("LiveStrategyRunner", () => {
     await expect(runner.feedClosedBar(makeBar(1000))).rejects.toThrow(/openPositionMarket/);
     expect(runner.getPositionStateList()).toHaveLength(0);
   });
+
+  it("snapshot/restore round-trips bar history and current bar (getHistory/getCurrentBar work after restore)", async () => {
+    const port = new FakeExecutionPort();
+    const runner = new LiveStrategyRunner(makeLadderStrategy(), { port });
+
+    await runner.feedClosedBar(makeBar(1000, 100));
+    await runner.feedClosedBar(makeBar(2000, 101));
+    await runner.feedClosedBar(makeBar(3000, 102));
+
+    expect(runner.getHistory(10).map((bar) => bar.time)).toEqual([1000, 2000]);
+    expect(runner.getCurrentBar().time).toBe(3000);
+
+    const snapshot = runner.getSnapshot();
+    const restored = new LiveStrategyRunner(makeLadderStrategy(), { port: new FakeExecutionPort() });
+
+    restored.restoreSnapshot(snapshot);
+
+    expect(() => restored.getCurrentBar()).not.toThrow();
+    expect(restored.getCurrentBar().time).toBe(3000);
+    expect(restored.getHistory(10).map((bar) => bar.time)).toEqual([1000, 2000]);
+  });
+
+  it("re-feeding already-incorporated bars after restore is idempotent (no doubled history, no index drift)", async () => {
+    const port = new FakeExecutionPort();
+    const runner = new LiveStrategyRunner(makeLadderStrategy(), { port });
+
+    await runner.feedClosedBar(makeBar(1000, 100));
+    await runner.feedClosedBar(makeBar(2000, 101));
+    await runner.feedClosedBar(makeBar(3000, 102));
+
+    const snapshot = runner.getSnapshot();
+    const restored = new LiveStrategyRunner(makeLadderStrategy(), { port: new FakeExecutionPort() });
+
+    restored.restoreSnapshot(snapshot);
+
+    const indexAfterRestore = restored.getBarIndex();
+
+    // The host replays already-seen klines (time <= current) after restore — they must be skipped.
+    restored.catchUpBar(makeBar(2000, 101));
+    restored.catchUpBar(makeBar(3000, 102));
+
+    expect(restored.getHistory(10).map((bar) => bar.time)).toEqual([1000, 2000]);
+    expect(restored.getBarIndex()).toBe(indexAfterRestore);
+    expect(restored.getCurrentBar().time).toBe(3000);
+
+    // A genuinely new closed bar (time > current) advances normally.
+    await restored.feedClosedBar(makeBar(4000, 103));
+
+    expect(restored.getHistory(10).map((bar) => bar.time)).toEqual([1000, 2000, 3000]);
+    expect(restored.getCurrentBar().time).toBe(4000);
+  });
+
+  it("restoring a legacy snapshot without bar context stays backward-compatible (history empty, getCurrentBar throws)", async () => {
+    const port = new FakeExecutionPort();
+    const runner = new LiveStrategyRunner(makeLadderStrategy(), { port });
+
+    await runner.feedClosedBar(makeBar(1000, 100));
+
+    const snapshot = runner.getSnapshot();
+    // Simulate a snapshot persisted by an older SDK that did not carry bar context.
+    const legacySnapshot = { ...snapshot };
+
+    delete legacySnapshot.barHistory;
+    delete legacySnapshot.oiHistory;
+    delete legacySnapshot.currentBar;
+    delete legacySnapshot.currentMaValues;
+    delete legacySnapshot.currentOiBar;
+
+    const restored = new LiveStrategyRunner(makeLadderStrategy(), { port: new FakeExecutionPort() });
+
+    restored.restoreSnapshot(legacySnapshot);
+
+    expect(restored.getHistory(10)).toEqual([]);
+    expect(() => restored.getCurrentBar()).toThrow(/No current bar/);
+  });
 });

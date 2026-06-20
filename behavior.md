@@ -43,12 +43,11 @@ interface Strategy {
   init?(env: TradingEnv): void;                                            // before first bar
   onBar(bar: Bar, maValues: MaValues, env: TradingEnv): void;              // every bar
   onOrderFill?(order: FilledOrder, env: TradingEnv): void;                 // after pending or SL fill
-  onBeforeLimitFill?(maValues: MaValues, env: TradingEnv): boolean;        // veto pending limits
   onEnd?(env: TradingEnv): void;                                            // after last bar
 }
 ```
 
-Required: `name`, `version`, `params`, `onBar`. Optional: `init`, `onOrderFill`, `onBeforeLimitFill`, `onEnd`, `allowedResolutions`, `requiredTimeframes`, `validateParams`, `createTradingEnv`.
+Required: `name`, `version`, `params`, `onBar`. Optional: `init`, `onOrderFill`, `onEnd`, `allowedResolutions`, `requiredTimeframes`, `validateParams`, `createTradingEnv`.
 
 The runtime validates these requirements when loading the strategy. Missing required fields cause the load to fail before the first bar is fed.
 
@@ -73,9 +72,7 @@ For each bar in chronological order, the runtime executes:
    1.2. currentBarIndex++, currentBar = bar
    1.3. updateRunningBest()           // for every open position
    1.4. checkStopLoss(bar)            // SL/TP — see §4 Fill priority
-   1.5. if pending limits exist:
-        — call strategy.onBeforeLimitFill?(maValues, env) — strategy may cancel/replace
-        — checkPendingOrders(bar) FIFO by createdAtBar
+   1.5. checkPendingOrders(bar)         // fill triggered pending limits, FIFO by createdAtBar
    1.6. applyFunding(bar)             // fund all open positions for any funding events ≤ bar.time
    1.7. equityList.push({ barIndex, timestamp, balance: effectiveBalance })
 
@@ -406,7 +403,7 @@ src/strategy-backtest/index.ts ← composition root for backtest bundle:
 The strategy itself **does not know which environment it runs in**. Both adapters implement `TradingEnv`; both build the same `StrategyRuntimeConfig` shape through different data sources.
 
 **Runtime semantics (what the player guarantees):**
-- `createTradingEnv` is called **once**, right after the strategy is loaded and the `StrategyRuntimeContext` is constructed. The result is the `env` passed to `init`, every `onBar`, every `onOrderFill` / `onBeforeLimitFill`, and `onEnd`.
+- `createTradingEnv` is called **once**, right after the strategy is loaded and the `StrategyRuntimeContext` is constructed. The result is the `env` passed to `init`, every `onBar`, every `onOrderFill`, and `onEnd`.
 - The inner `StrategyRuntimeContext` continues to handle `processBar`, `forceCloseAll`, and result accumulation — those aren't part of the `TradingEnv` interface and aren't seen by the strategy.
 - Adapter methods that don't change behavior (`openLong`, `placeLimitOrder`, `getHistory`, etc.) **must delegate to `innerEnv`** so position tracking and history work correctly. Only methods the adapter wants to override (commonly `getConfig`) carry custom logic.
 - The adapter runs inside the same sandbox as the strategy (same whitelist of globals, same 5s startup timeout when compiling). No I/O, no Node built-ins.
@@ -438,7 +435,8 @@ Runs the SAME strategy code outside the backtest player:
   - **Position aggregation**: the strategy holds N small positions (one per limit fill, as in the player) while the exchange holds ONE netted position — protective orders sync as a single exchange order for the total size (the strategy must keep one uniform protective price; the last `setStopLoss`/`setTakeProfit` price wins).
   - **TP semantics mirror the player**: `handleTakeProfitFilled` does NOT call `onOrderFill`; the strategy reconciles via `getPositionList()` on the next bar.
   - **Catch-up mode** (`startCatchUp`/`completeCatchUp`): replay history through the strategy without touching the exchange, then sync only the final desired state — for manual late entries and restart recovery.
-  - **Snapshot/restore** (`getSnapshot`/`restoreSnapshot`): persists the books + the optional `Strategy.getStateSnapshot()`/`restoreStateSnapshot()` payload so a host can resume mid-setup after a restart.
+  - **Snapshot/restore** (`getSnapshot`/`restoreSnapshot`): persists the order/position books, the rolling bar/OI history + current bar/MA, and the optional `Strategy.getStateSnapshot()`/`restoreStateSnapshot()` payload, so a host can resume after a restart with `getCurrentBar()`/`getHistory(N)`/`getMaValues`/OI accessors working **immediately** — no warm-up replay required. The bar context is bounded by the runner's `historyLimit`. (Backward-compat: a snapshot taken by an older SDK without bar context restores the books only; then `getCurrentBar()` throws until the first `feedClosedBar`/`catchUpBar`, exactly as before.)
+  - **Idempotent bar feed**: `feedClosedBar`/`catchUpBar` skip a closed bar whose `time ≤` the last incorporated bar (no strategy run, no sync, no index advance). So a host that, after a restore, replays already-seen or missed klines via `catchUpBar`/`feedClosedBar` will **not** double its history or drift the bar index — restore and catch-up compose safely.
   - **Market entries in live ARE supported**: `openLong`/`openShort` record a desired market entry that the post-bar sync executes through the optional `LiveExecutionPort.openPositionMarket` (firing `onOrderFill` with `type: "market"`, emitting `market_entry_filled`). If the host's port does **not** implement `openPositionMarket`, `openLong`/`openShort` **throw immediately** — the entry is never silently dropped. Strategies that only use `placeLimitOrder` never touch this path.
   - Unsupported in live: MTF history (`getHistory(N, resolution)` returns `[]`), aux series (null), funding (null).
 
