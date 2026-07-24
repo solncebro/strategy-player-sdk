@@ -6,6 +6,7 @@ import type {
   EquityPoint,
   FundingRate,
   MaValues,
+  OiProvider,
   ParamValue,
   PendingOrder,
   Position,
@@ -23,6 +24,8 @@ export interface MockTradingEnvOptions {
   rawConfig?: Record<string, unknown>;
   auxSeriesData?: AuxSeriesData;
   timeframeDataList?: TimeframeData[];
+  /** Live read-through OI source; when set, the runtime neither accumulates nor reads its own OI series. */
+  oiProvider?: OiProvider;
 }
 
 export interface FeedBarInput {
@@ -44,6 +47,7 @@ export class MockTradingEnv {
       rawConfig: options?.rawConfig,
       auxSeriesData: options?.auxSeriesData,
       timeframeDataList: options?.timeframeDataList,
+      oiProvider: options?.oiProvider,
     });
     this.runtime.setStrategy(strategy);
     this.strategy = strategy;

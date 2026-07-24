@@ -4,6 +4,7 @@ import type {
   Bar,
   MaValues,
   OiOhlc,
+  OiProvider,
   ParamValue,
   PendingOrder,
   Position,
@@ -26,6 +27,9 @@ import { MARKET_CLOSE_FILLED_EVENT, MARKET_ENTRY_FILLED_EVENT } from "./types";
 
 const ZERO_MA: MaValues = { ma25: 0, ma50: 0, ma100: 0, ma200: 0 };
 const DEFAULT_HISTORY_LIMIT = 1000;
+/** A reduced entry landing spawns a shortfall order placed in the SAME sync; this bounds the passes
+ *  so an exchange that keeps reducing cannot loop forever (leftovers retry on the next sync). */
+const MAX_ENTRY_PLACEMENT_PASS_COUNT = 3;
 
 /**
  * Drives ONE strategy instance (= one symbol+direction) against a live exchange through a
@@ -35,8 +39,10 @@ const DEFAULT_HISTORY_LIMIT = 1000;
  *
  * Aggregation: the strategy holds N small positions (one per limit fill, mirroring the backtest
  * runtime), while the exchange holds ONE netted position. Protective orders (stop-loss /
- * take-profit) therefore sync as a single exchange order covering the total size; the strategy is
- * expected to keep one uniform protective price across its positions (the last set price wins).
+ * take-profit) therefore sync as ONE logical order covering the total size — physically a SET of
+ * exchange orders when the size exceeds the per-order cap (the port owns the splitting; the runner
+ * tracks the piece id list). The strategy is expected to keep one uniform protective price across
+ * its positions (the last set price wins, same for the optional exit-reason code).
  *
  * Take-profit fills mirror the backtest runtime semantics: they do NOT produce onOrderFill — the
  * strategy reconciles its position list via getPosition/getPositionList on the next bar.
@@ -52,6 +58,7 @@ export class LiveStrategyRunner implements TradingEnv {
   private readonly onEvent?: (event: BacktestEvent) => void;
   private readonly balanceProvider?: () => number;
   private readonly historyLimit: number;
+  private readonly oiProvider: OiProvider | null;
 
   private barHistory: Bar[] = [];
   private currentBar: Bar | null = null;
@@ -66,16 +73,21 @@ export class LiveStrategyRunner implements TradingEnv {
   private positionList: LivePositionState[] = [];
   private desiredStopLossPrice: number | null = null;
   private desiredTakeProfitPrice: number | null = null;
-  private stopLossExchangeOrderId: string | null = null;
-  private takeProfitExchangeOrderId: string | null = null;
+  private desiredStopLossReason: string | null = null;
+  private desiredTakeProfitReason: string | null = null;
+  private stopLossExchangeOrderIdList: string[] = [];
+  private takeProfitExchangeOrderIdList: string[] = [];
   private lastSyncedStopLoss: ProtectiveOrderSyncState | null = null;
   private lastSyncedTakeProfit: ProtectiveOrderSyncState | null = null;
+  private isProtectiveSyncHeld = false;
   private pendingCloseAmountUsd = 0;
   private pendingCloseContracts = 0;
   private nextLocalOrderNumber = 1;
   private nextLocalPositionNumber = 1;
   private isCatchUpActive = false;
   private isInitialized = false;
+  private isSyncRunning = false;
+  private isSyncRerunRequested = false;
 
   constructor(strategy: Strategy, options: LiveStrategyRunnerOptions) {
     this.strategy = strategy;
@@ -85,6 +97,7 @@ export class LiveStrategyRunner implements TradingEnv {
     this.onEvent = options.onEvent;
     this.balanceProvider = options.getBalanceUsd;
     this.historyLimit = options.historyLimit ?? DEFAULT_HISTORY_LIMIT;
+    this.oiProvider = options.oiProvider ?? null;
   }
 
   // ---------------------------------------------------------------------- runner API
@@ -119,7 +132,8 @@ export class LiveStrategyRunner implements TradingEnv {
 
     if (this.currentBar) {
       this.barHistory.push(this.currentBar);
-      this.oiHistory.push(this.currentOiBar);
+
+      if (this.oiProvider === null) this.oiHistory.push(this.currentOiBar);
 
       if (this.barHistory.length > this.historyLimit) {
         this.barHistory.splice(0, this.barHistory.length - this.historyLimit);
@@ -133,7 +147,7 @@ export class LiveStrategyRunner implements TradingEnv {
     this.currentBarIndex++;
     this.currentBar = bar;
     this.currentMaValues = maValues ?? null;
-    this.currentOiBar = oiBar ?? null;
+    this.currentOiBar = this.oiProvider === null ? (oiBar ?? null) : null;
     this.updateRunningBest(bar);
 
     return true;
@@ -179,14 +193,21 @@ export class LiveStrategyRunner implements TradingEnv {
     // (backtest/paper, where fills are intra-bar) fall back to currentBar.
     const fillTime = args.fillBar?.openTimestamp ?? this.currentBar?.time ?? 0;
 
+    // A partial fill the engine crystallized supplies the real filled notional; a full fill (and all
+    // backtest/paper fills, which consume the whole order) omits it, so the order's amountUsd stands.
+    const filledAmountUsd = args.filledAmountUsd ?? order.amountUsd;
+    // The exchange's real average fill price wins over the limit target — a resting limit can fill
+    // better than its price, and the book must mirror the exchange (see EntryOrderFilledArgs).
+    const fillPrice = args.avgFillPrice ?? order.price;
+
     const position: LivePositionState = {
       localPositionId: `pos_${this.nextLocalPositionNumber++}`,
       side: order.side === "buy" ? "long" : "short",
-      entryPrice: order.price,
-      amountUsd: order.amountUsd,
-      contracts: order.amountUsd / order.price,
+      entryPrice: fillPrice,
+      amountUsd: filledAmountUsd,
+      contracts: filledAmountUsd / fillPrice,
       entryTime: fillTime,
-      runningBest: order.price,
+      runningBest: fillPrice,
     };
 
     this.positionList.push(position);
@@ -197,8 +218,8 @@ export class LiveStrategyRunner implements TradingEnv {
           id: order.localOrderId,
           side: order.side,
           type: "limit",
-          price: order.price,
-          amount: order.amountUsd,
+          price: fillPrice,
+          amountUsd: filledAmountUsd,
           fillTime,
           positionId: position.localPositionId,
           fillBarOpenTimestamp: args.fillBar?.openTimestamp,
@@ -212,6 +233,9 @@ export class LiveStrategyRunner implements TradingEnv {
     await this.sync();
   }
 
+  /** The host must call this only when the protective exit is COMPLETE — every stop piece is
+   *  terminal and the exchange position is confirmed flat. The whole book clears; the price is the
+   *  volume-weighted average across the pieces. */
   async handleStopLossFilled(args: ProtectiveOrderFilledArgs): Promise<void> {
     this.ensureInitialized();
 
@@ -220,8 +244,13 @@ export class LiveStrategyRunner implements TradingEnv {
     this.positionList = [];
     this.desiredStopLossPrice = null;
     this.desiredTakeProfitPrice = null;
-    this.stopLossExchangeOrderId = null;
+    this.desiredStopLossReason = null;
+    this.desiredTakeProfitReason = null;
+    this.stopLossExchangeOrderIdList = [];
     this.lastSyncedStopLoss = null;
+    // The trade is over — the ladder tail must not survive it (leftover rungs would re-open a
+    // position out of nowhere). Cancelled in the same sync below, not on the next bar.
+    this.cancelAllOrders();
 
     for (const position of closedList) {
       if (this.strategy.onOrderFill) {
@@ -231,7 +260,7 @@ export class LiveStrategyRunner implements TradingEnv {
             side: position.side === "long" ? "sell" : "buy",
             type: "stop",
             price: args.price,
-            amount: position.amountUsd,
+            amountUsd: position.amountUsd,
             fillTime: this.currentBar?.time ?? 0,
             positionId: position.localPositionId,
             entryPrice: position.entryPrice,
@@ -253,14 +282,18 @@ export class LiveStrategyRunner implements TradingEnv {
   }
 
   // Mirror of the backtest runtime: a take-profit close does NOT call onOrderFill — the strategy
-  // reconciles its position list on the next bar.
+  // reconciles its position list on the next bar. The host must call this only when the protective
+  // exit is COMPLETE — every take-profit piece is terminal and the exchange position is confirmed flat.
   async handleTakeProfitFilled(_args: ProtectiveOrderFilledArgs): Promise<void> {
     this.ensureInitialized();
     this.positionList = [];
     this.desiredStopLossPrice = null;
     this.desiredTakeProfitPrice = null;
-    this.takeProfitExchangeOrderId = null;
+    this.desiredStopLossReason = null;
+    this.desiredTakeProfitReason = null;
+    this.takeProfitExchangeOrderIdList = [];
     this.lastSyncedTakeProfit = null;
+    this.cancelAllOrders();
     await this.sync();
   }
 
@@ -272,6 +305,9 @@ export class LiveStrategyRunner implements TradingEnv {
     this.positionList = [];
     this.desiredStopLossPrice = null;
     this.desiredTakeProfitPrice = null;
+    this.desiredStopLossReason = null;
+    this.desiredTakeProfitReason = null;
+    this.cancelAllOrders();
     await this.sync();
   }
 
@@ -284,17 +320,24 @@ export class LiveStrategyRunner implements TradingEnv {
       positionList: this.positionList.map((position) => ({ ...position })),
       desiredStopLossPrice: this.desiredStopLossPrice,
       desiredTakeProfitPrice: this.desiredTakeProfitPrice,
-      stopLossExchangeOrderId: this.stopLossExchangeOrderId,
-      takeProfitExchangeOrderId: this.takeProfitExchangeOrderId,
+      desiredStopLossReason: this.desiredStopLossReason,
+      desiredTakeProfitReason: this.desiredTakeProfitReason,
+      stopLossExchangeOrderIdList: [...this.stopLossExchangeOrderIdList],
+      takeProfitExchangeOrderIdList: [...this.takeProfitExchangeOrderIdList],
       lastSyncedStopLoss: this.lastSyncedStopLoss ? { ...this.lastSyncedStopLoss } : null,
       lastSyncedTakeProfit: this.lastSyncedTakeProfit ? { ...this.lastSyncedTakeProfit } : null,
       nextLocalOrderNumber: this.nextLocalOrderNumber,
       nextLocalPositionNumber: this.nextLocalPositionNumber,
       barHistory: this.barHistory.map((entry) => ({ ...entry })),
-      oiHistory: this.oiHistory.map((entry) => (entry ? { ...entry } : null)),
       currentBar: this.currentBar ? { ...this.currentBar } : null,
       currentMaValues: this.currentMaValues ? { ...this.currentMaValues } : null,
-      currentOiBar: this.currentOiBar ? { ...this.currentOiBar } : null,
+      // With an oiProvider the runner owns no OI series — omit both so a restore never seeds one.
+      ...(this.oiProvider === null
+        ? {
+            oiHistory: this.oiHistory.map((entry) => (entry ? { ...entry } : null)),
+            currentOiBar: this.currentOiBar ? { ...this.currentOiBar } : null,
+          }
+        : {}),
     };
   }
 
@@ -305,8 +348,15 @@ export class LiveStrategyRunner implements TradingEnv {
     this.positionList = snapshot.positionList.map((position) => ({ ...position }));
     this.desiredStopLossPrice = snapshot.desiredStopLossPrice;
     this.desiredTakeProfitPrice = snapshot.desiredTakeProfitPrice;
-    this.stopLossExchangeOrderId = snapshot.stopLossExchangeOrderId;
-    this.takeProfitExchangeOrderId = snapshot.takeProfitExchangeOrderId;
+    this.desiredStopLossReason = snapshot.desiredStopLossReason ?? null;
+    this.desiredTakeProfitReason = snapshot.desiredTakeProfitReason ?? null;
+
+    // Pre-2.0 snapshots carried a single protective order id — restored as a one-element list.
+    this.stopLossExchangeOrderIdList = snapshot.stopLossExchangeOrderIdList
+      ?? (snapshot.stopLossExchangeOrderId ? [snapshot.stopLossExchangeOrderId] : []);
+    this.takeProfitExchangeOrderIdList = snapshot.takeProfitExchangeOrderIdList
+      ?? (snapshot.takeProfitExchangeOrderId ? [snapshot.takeProfitExchangeOrderId] : []);
+
     this.lastSyncedStopLoss = snapshot.lastSyncedStopLoss ? { ...snapshot.lastSyncedStopLoss } : null;
     this.lastSyncedTakeProfit = snapshot.lastSyncedTakeProfit ? { ...snapshot.lastSyncedTakeProfit } : null;
     this.nextLocalOrderNumber = snapshot.nextLocalOrderNumber;
@@ -347,12 +397,43 @@ export class LiveStrategyRunner implements TradingEnv {
     return this.positionList.map((position) => ({ ...position }));
   }
 
-  getStopLossExchangeOrderId(): string | null {
-    return this.stopLossExchangeOrderId;
+  getStopLossExchangeOrderIdList(): string[] {
+    return [...this.stopLossExchangeOrderIdList];
   }
 
-  getTakeProfitExchangeOrderId(): string | null {
-    return this.takeProfitExchangeOrderId;
+  getTakeProfitExchangeOrderIdList(): string[] {
+    return [...this.takeProfitExchangeOrderIdList];
+  }
+
+  getDesiredStopLossReason(): string | null {
+    return this.desiredStopLossReason;
+  }
+
+  getDesiredTakeProfitReason(): string | null {
+    return this.desiredTakeProfitReason;
+  }
+
+  /** Drop the synced markers so the next sync re-places both protective order sets at the current
+   *  desired values — the host's escape hatch when it detects the exchange lost part of the set. */
+  invalidateProtectiveSync(): void {
+    this.lastSyncedStopLoss = null;
+    this.lastSyncedTakeProfit = null;
+  }
+
+  /** Invalidate AND re-sync the protective sets right away. The host's coverage watchdog uses this
+   *  so a detected deficit heals on the watchdog cadence (seconds) instead of waiting for the next
+   *  bar to trigger a sync — an unprotected remainder must live as briefly as possible. */
+  async resyncProtectiveOrders(): Promise<void> {
+    this.ensureInitialized();
+    this.invalidateProtectiveSync();
+    await this.sync();
+  }
+
+  /** While held, protective REPLACE placements are frozen (a protective exit is being finalized —
+   *  re-placing mid-exit would fight the fills). Cancels still run: finalizing a stop must still be
+   *  able to cancel the orphaned take-profit set, and vice versa. */
+  setProtectiveSyncHold(isHeld: boolean): void {
+    this.isProtectiveSyncHeld = isHeld;
   }
 
   // ---------------------------------------------------------------------- TradingEnv
@@ -361,14 +442,14 @@ export class LiveStrategyRunner implements TradingEnv {
   // here and executed in sync(). If the port does not implement openPositionMarket we throw
   // immediately (via requireMarketEntrySupport) so the host learns about the misconfiguration
   // instead of silently dropping the entry. Strategies that use placeLimitOrder never touch this path.
-  openLong(size: number, _options?: PositionOptions): void {
+  openLong(sizeUsd: number, _options?: PositionOptions): void {
     this.requireMarketEntrySupport();
-    this.desiredMarketEntry = { side: "buy", amountUsd: size };
+    this.desiredMarketEntry = { side: "buy", amountUsd: sizeUsd };
   }
 
-  openShort(size: number, _options?: PositionOptions): void {
+  openShort(sizeUsd: number, _options?: PositionOptions): void {
     this.requireMarketEntrySupport();
-    this.desiredMarketEntry = { side: "sell", amountUsd: size };
+    this.desiredMarketEntry = { side: "sell", amountUsd: sizeUsd };
   }
 
   closeLong(): void {
@@ -383,19 +464,32 @@ export class LiveStrategyRunner implements TradingEnv {
     if (position) this.closePosition(position.localPositionId);
   }
 
-  placeLimitOrder(side: "buy" | "sell", price: number, amount: number): string {
-    const localOrderId = `lo_${this.nextLocalOrderNumber++}`;
+  // One logical strategy order books as ONE entry per cap piece (the port owns the split): every
+  // piece then fills, expires and cancels through the ordinary book lifecycle, and a notional over
+  // the exchange's per-order cap can never be silently reduced. Returns the FIRST piece's local id;
+  // strategies that store it for a targeted cancel/modify only reach the first piece — rubber's
+  // strategy cancels by iterating getPendingOrderList, which reaches them all.
+  placeLimitOrder(side: "buy" | "sell", price: number, amountUsd: number): string {
+    const pieceNotionalList = this.port.splitEntryNotionalUsd?.({ price, amountUsd }) ?? [amountUsd];
+    const bookNotionalList = pieceNotionalList.length > 0 ? pieceNotionalList : [amountUsd];
+    let firstLocalOrderId = "";
 
-    this.entryOrderList.push({
-      localOrderId,
-      side,
-      price,
-      amountUsd: amount,
-      exchangeOrderId: null,
-      createdAtBar: this.currentBarIndex,
-    });
+    for (const pieceNotional of bookNotionalList) {
+      const localOrderId = `lo_${this.nextLocalOrderNumber++}`;
 
-    return localOrderId;
+      if (firstLocalOrderId === "") firstLocalOrderId = localOrderId;
+
+      this.entryOrderList.push({
+        localOrderId,
+        side,
+        price,
+        amountUsd: pieceNotional,
+        exchangeOrderId: null,
+        createdAtBar: this.currentBarIndex,
+      });
+    }
+
+    return firstLocalOrderId;
   }
 
   cancelOrder(orderId: string): boolean {
@@ -403,11 +497,17 @@ export class LiveStrategyRunner implements TradingEnv {
 
     if (!order) return false;
 
-    if (order.exchangeOrderId !== null) {
-      this.cancelRequestList.push({ localOrderId: order.localOrderId, exchangeOrderId: order.exchangeOrderId });
+    // Never placed on the exchange yet — nothing to confirm, drop it locally right away.
+    if (order.exchangeOrderId === null) {
+      this.entryOrderList = this.entryOrderList.filter((entry) => entry.localOrderId !== orderId);
+
+      return true;
     }
 
-    this.entryOrderList = this.entryOrderList.filter((entry) => entry.localOrderId !== orderId);
+    // Placed: only MARK it. The order leaves the book when the exchange confirms the cancel in
+    // sync() — a cancel lost to a transient failure keeps the order tracked (its fill still routes,
+    // the reconciliation poll still sees it) and sync retries the cancel every cycle.
+    order.isCancelRequested = true;
 
     return true;
   }
@@ -439,7 +539,7 @@ export class LiveStrategyRunner implements TradingEnv {
       side: entry.side,
       type: "limit" as const,
       price: entry.price,
-      amount: entry.amountUsd,
+      amountUsd: entry.amountUsd,
       createdAtBar: entry.createdAtBar,
     }));
   }
@@ -474,6 +574,9 @@ export class LiveStrategyRunner implements TradingEnv {
     if (this.positionList.length === 0) {
       this.desiredStopLossPrice = null;
       this.desiredTakeProfitPrice = null;
+      this.desiredStopLossReason = null;
+      this.desiredTakeProfitReason = null;
+      this.cancelAllOrders();
     }
   }
 
@@ -483,13 +586,14 @@ export class LiveStrategyRunner implements TradingEnv {
     }
   }
 
-  setStopLoss(positionIdOrPrice: string | number, price?: number): void {
+  setStopLoss(positionIdOrPrice: string | number, price?: number, reason?: string): void {
     if (typeof positionIdOrPrice === "number") {
       const first = this.positionList[0];
 
       if (first) {
         first.stopLoss = positionIdOrPrice;
         this.desiredStopLossPrice = positionIdOrPrice;
+        this.desiredStopLossReason = reason ?? null;
       }
 
       return;
@@ -500,15 +604,17 @@ export class LiveStrategyRunner implements TradingEnv {
     if (position && price !== undefined) {
       position.stopLoss = price;
       this.desiredStopLossPrice = price;
+      this.desiredStopLossReason = reason ?? null;
     }
   }
 
-  setTakeProfit(positionId: string, price: number): void {
+  setTakeProfit(positionId: string, price: number, reason?: string): void {
     const position = this.positionList.find((entry) => entry.localPositionId === positionId);
 
     if (position) {
       position.takeProfit = price;
       this.desiredTakeProfitPrice = price;
+      this.desiredTakeProfitReason = reason ?? null;
     }
   }
 
@@ -541,14 +647,20 @@ export class LiveStrategyRunner implements TradingEnv {
   }
 
   getOiClose(_resolution?: string): number | null {
-    return this.currentOiBar?.close ?? null;
+    return this.getOiOhlc()?.close ?? null;
   }
 
   getOiOhlc(_resolution?: string): OiOhlc | null {
+    if (this.oiProvider !== null) return this.currentBar ? this.oiProvider(this.currentBar.time) : null;
+
     return this.currentOiBar;
   }
 
+  // With a provider the series resolves by the price bars' times at call time — index-aligned with
+  // the legacy frozen series (barHistory never contains the current bar), but late OI becomes visible.
   getOiOhlcHistory(count: number, _resolution?: string): Array<OiOhlc | null> {
+    if (this.oiProvider !== null) return this.barHistory.slice(-count).map((bar) => this.oiProvider!(bar.time));
+
     return this.oiHistory.slice(-count);
   }
 
@@ -574,7 +686,7 @@ export class LiveStrategyRunner implements TradingEnv {
 
   getAuxHistory(series: AuxSeriesKind, count: number, _resolution?: string): Array<number | null> {
     if (series === "oi") {
-      return this.oiHistory.slice(-count).map((bar) => bar?.close ?? null);
+      return this.getOiOhlcHistory(count).map((bar) => bar?.close ?? null);
     }
 
     return [];
@@ -621,7 +733,7 @@ export class LiveStrategyRunner implements TradingEnv {
       id: position.localPositionId,
       side: position.side,
       entryPrice: position.entryPrice,
-      size: position.amountUsd,
+      sizeUsd: position.amountUsd,
       entryTime: position.entryTime,
       stopLoss: position.stopLoss,
       takeProfit: position.takeProfit,
@@ -649,11 +761,48 @@ export class LiveStrategyRunner implements TradingEnv {
     return this.positionList.reduce((sum, position) => sum + position.amountUsd, 0);
   }
 
+  // Serialisation lock: a sync requested while one is already running (an exchange fill event lands
+  // mid-placement) must NEVER run concurrently — two passes would both see not-yet-placed orders and
+  // place them twice (the SOXLUSDT doubled-ladder incident). The re-entrant request only marks a
+  // rerun; the lock owner repeats the pass until no rerun is pending, so mid-sync state changes are
+  // still materialised. A flag (not a promise chain) so a re-entrant caller returns immediately and
+  // cannot deadlock the pass it interrupted.
+  private async sync(): Promise<void> {
+    if (this.isSyncRunning) {
+      this.isSyncRerunRequested = true;
+
+      return;
+    }
+
+    this.isSyncRunning = true;
+
+    try {
+      do {
+        this.isSyncRerunRequested = false;
+        await this.executeSync();
+      } while (this.isSyncRerunRequested);
+    } finally {
+      this.isSyncRunning = false;
+    }
+  }
+
   // Desired-state sync: cancels first, then entry placements, then market closes, then protective
   // orders — so the exchange never briefly holds both an outdated ladder and the new one.
-  private async sync(): Promise<void> {
+  private async executeSync(): Promise<void> {
     if (this.isCatchUpActive) return;
 
+    // Requested cancels: the order leaves the book ONLY when the port confirms the exchange
+    // accepted the cancellation. A failed cancel keeps the order tracked and retries next sync.
+    for (const order of this.entryOrderList.filter((entry) => entry.isCancelRequested && entry.exchangeOrderId !== null)) {
+      const isCancelled = await this.port.cancelEntryOrder({ localOrderId: order.localOrderId, exchangeOrderId: order.exchangeOrderId as string });
+
+      if (isCancelled) {
+        this.entryOrderList = this.entryOrderList.filter((entry) => entry.localOrderId !== order.localOrderId);
+      }
+    }
+
+    // Modify-price replacements still use the fire-and-forget queue (the order stays in the book
+    // with exchangeOrderId reset, so it is re-placed below either way).
     const cancelList = [...this.cancelRequestList];
 
     this.cancelRequestList = [];
@@ -662,19 +811,45 @@ export class LiveStrategyRunner implements TradingEnv {
       await this.port.cancelEntryOrder(cancelArgs);
     }
 
-    for (const order of this.entryOrderList.filter((entry) => entry.exchangeOrderId === null)) {
-      const exchangeOrderId = await this.port.placeEntryOrder({
-        localOrderId: order.localOrderId,
-        side: order.side,
-        price: order.price,
-        amountUsd: order.amountUsd,
-      });
+    // Multi-pass placement: a reduced landing shrinks the booked order to what the exchange really
+    // accepted and pushes the shortfall as a fresh order, placed by the NEXT pass of this same sync
+    // — the intended notional reaches the exchange immediately, never waiting for another bar.
+    for (let placementPass = 0; placementPass < MAX_ENTRY_PLACEMENT_PASS_COUNT; placementPass++) {
+      const unplacedList = this.entryOrderList.filter((entry) => entry.exchangeOrderId === null);
 
-      if (exchangeOrderId === null) {
-        this.entryOrderList = this.entryOrderList.filter((entry) => entry.localOrderId !== order.localOrderId);
-        this.emitEvent("entry_order_rejected", { localOrderId: order.localOrderId, price: order.price });
-      } else {
-        order.exchangeOrderId = exchangeOrderId;
+      if (unplacedList.length === 0) break;
+
+      for (const order of unplacedList) {
+        const result = await this.port.placeEntryOrder({
+          localOrderId: order.localOrderId,
+          side: order.side,
+          price: order.price,
+          amountUsd: order.amountUsd,
+        });
+
+        if (result === null) {
+          this.entryOrderList = this.entryOrderList.filter((entry) => entry.localOrderId !== order.localOrderId);
+          this.emitEvent("entry_order_rejected", { localOrderId: order.localOrderId, price: order.price });
+          continue;
+        }
+
+        order.exchangeOrderId = result.exchangeOrderId;
+
+        const acceptedAmountUsd = result.acceptedAmountUsd;
+
+        if (acceptedAmountUsd === undefined || acceptedAmountUsd >= order.amountUsd) continue;
+
+        const shortfallAmountUsd = order.amountUsd - acceptedAmountUsd;
+
+        order.amountUsd = acceptedAmountUsd;
+        this.entryOrderList.push({
+          localOrderId: `lo_${this.nextLocalOrderNumber++}`,
+          side: order.side,
+          price: order.price,
+          amountUsd: shortfallAmountUsd,
+          exchangeOrderId: null,
+          createdAtBar: order.createdAtBar,
+        });
       }
     }
 
@@ -743,7 +918,7 @@ export class LiveStrategyRunner implements TradingEnv {
           side: entry.side,
           type: "market",
           price: result.entryPrice,
-          amount: entry.amountUsd,
+          amountUsd: entry.amountUsd,
           fillTime: this.currentBar?.time ?? 0,
           positionId: position.localPositionId,
         },
@@ -759,6 +934,10 @@ export class LiveStrategyRunner implements TradingEnv {
     });
   }
 
+  // Each protective side syncs its SET of exchange orders (several pieces when the quantity exceeds
+  // the per-order cap — the port owns the splitting). Cancel branches always run; replace branches
+  // are frozen while the host holds the sync (a protective exit is being finalized). An incomplete
+  // replace keeps lastSynced null, so the next sync cancels the stored partial set and re-places.
   private async syncProtectiveOrders(): Promise<void> {
     const hasPositions = this.positionList.length > 0;
     const desiredStopLoss = hasPositions && this.desiredStopLossPrice !== null
@@ -768,43 +947,44 @@ export class LiveStrategyRunner implements TradingEnv {
       ? { price: this.desiredTakeProfitPrice, contracts: this.getTotalContracts() }
       : null;
 
-    if (!desiredStopLoss && this.stopLossExchangeOrderId !== null) {
-      const orderId = this.stopLossExchangeOrderId;
+    if (!desiredStopLoss && this.stopLossExchangeOrderIdList.length > 0) {
+      const orderIdList = this.stopLossExchangeOrderIdList;
 
-      this.stopLossExchangeOrderId = null;
+      this.stopLossExchangeOrderIdList = [];
       this.lastSyncedStopLoss = null;
-      await this.port.cancelStopLoss({ exchangeOrderId: orderId });
-    } else if (desiredStopLoss && !this.isProtectiveOrderSynced(this.lastSyncedStopLoss, desiredStopLoss)) {
-      const newOrderId = await this.port.replaceStopLoss({
-        previousExchangeOrderId: this.stopLossExchangeOrderId,
+      await this.port.cancelStopLoss({ exchangeOrderIdList: orderIdList });
+    } else if (desiredStopLoss && !this.isProtectiveSyncHeld && !this.isProtectiveOrderSynced(this.lastSyncedStopLoss, desiredStopLoss)) {
+      const result = await this.port.replaceStopLoss({
+        previousExchangeOrderIdList: this.stopLossExchangeOrderIdList,
         price: desiredStopLoss.price,
         amountUsd: this.getTotalAmountUsd(),
         contracts: desiredStopLoss.contracts,
+        reason: this.desiredStopLossReason,
       });
 
-      if (newOrderId !== null) {
-        this.stopLossExchangeOrderId = newOrderId;
-        this.lastSyncedStopLoss = desiredStopLoss;
+      if (result !== null) {
+        this.stopLossExchangeOrderIdList = result.exchangeOrderIdList;
+        this.lastSyncedStopLoss = result.isComplete ? desiredStopLoss : null;
       }
     }
 
-    if (!desiredTakeProfit && this.takeProfitExchangeOrderId !== null) {
-      const orderId = this.takeProfitExchangeOrderId;
+    if (!desiredTakeProfit && this.takeProfitExchangeOrderIdList.length > 0) {
+      const orderIdList = this.takeProfitExchangeOrderIdList;
 
-      this.takeProfitExchangeOrderId = null;
+      this.takeProfitExchangeOrderIdList = [];
       this.lastSyncedTakeProfit = null;
-      await this.port.cancelTakeProfit({ exchangeOrderId: orderId });
-    } else if (desiredTakeProfit && !this.isProtectiveOrderSynced(this.lastSyncedTakeProfit, desiredTakeProfit)) {
-      const newOrderId = await this.port.replaceTakeProfit({
-        previousExchangeOrderId: this.takeProfitExchangeOrderId,
+      await this.port.cancelTakeProfit({ exchangeOrderIdList: orderIdList });
+    } else if (desiredTakeProfit && !this.isProtectiveSyncHeld && !this.isProtectiveOrderSynced(this.lastSyncedTakeProfit, desiredTakeProfit)) {
+      const result = await this.port.replaceTakeProfit({
+        previousExchangeOrderIdList: this.takeProfitExchangeOrderIdList,
         price: desiredTakeProfit.price,
         amountUsd: this.getTotalAmountUsd(),
         contracts: desiredTakeProfit.contracts,
       });
 
-      if (newOrderId !== null) {
-        this.takeProfitExchangeOrderId = newOrderId;
-        this.lastSyncedTakeProfit = desiredTakeProfit;
+      if (result !== null) {
+        this.takeProfitExchangeOrderIdList = result.exchangeOrderIdList;
+        this.lastSyncedTakeProfit = result.isComplete ? desiredTakeProfit : null;
       }
     }
   }

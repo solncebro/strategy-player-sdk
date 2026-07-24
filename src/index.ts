@@ -17,6 +17,7 @@ export type {
   FundingRate,
   MaValues,
   OiOhlc,
+  OiProvider,
   ParamsValidationResult,
   ParamValue,
   PendingOrder,
@@ -34,4 +35,4 @@ export type {
 export type { StrategySpec, TypedTradingEnv } from "./define-strategy";
 export { defineStrategy } from "./define-strategy";
 
-export const API_VERSION = "1.8.0";
+export const API_VERSION = "2.1.0";

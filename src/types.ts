@@ -21,6 +21,10 @@ export interface MaValues {
 export interface PositionOptions {
   stopLoss?: number;
   takeProfit?: number;
+  /** Machine code recorded as `Trade.exitReason` if this stop fires (falls back to `"stop_loss"`). */
+  stopLossReason?: string;
+  /** Machine code recorded as `Trade.exitReason` if this take fires (falls back to `"take_profit"`). */
+  takeProfitReason?: string;
   tag?: string;
 }
 
@@ -28,10 +32,15 @@ export interface Position {
   id: string;
   side: "long" | "short";
   entryPrice: number;
-  size: number;
+  /** Position size in QUOTE currency (USD notional) — money, NOT contract quantity. */
+  sizeUsd: number;
   entryTime: number;
   stopLoss?: number;
   takeProfit?: number;
+  /** Machine code recorded as `Trade.exitReason` when `stopLoss` fires (falls back to `"stop_loss"`). Set via `setStopLoss(id, price, reason)`. */
+  stopLossReason?: string;
+  /** Machine code recorded as `Trade.exitReason` when `takeProfit` fires (falls back to `"take_profit"`). Set via `setTakeProfit(id, price, reason)`. */
+  takeProfitReason?: string;
   tag?: string;
   pnl: number;
   runningBest: number;
@@ -42,7 +51,8 @@ export interface PendingOrder {
   side: "buy" | "sell";
   type: "limit" | "stop";
   price: number;
-  amount: number;
+  /** Order size in QUOTE currency (USD notional) — money, NOT contract quantity. */
+  amountUsd: number;
   createdAtBar: number;
 }
 
@@ -51,7 +61,8 @@ export interface FilledOrder {
   side: "buy" | "sell";
   type: "limit" | "stop" | "market";
   price: number;
-  amount: number;
+  /** Order size in QUOTE currency (USD notional) — money, NOT contract quantity. */
+  amountUsd: number;
   fillTime: number;
   positionId: string | null;
   entryPrice?: number;
@@ -76,7 +87,8 @@ export interface Trade {
   side: "long" | "short";
   entryPrice: number;
   exitPrice: number;
-  size: number;
+  /** Trade size in QUOTE currency (USD notional) — money, NOT contract quantity. */
+  sizeUsd: number;
   pnl: number;
   pnlPercent: number;
   entryTime: number;
@@ -134,6 +146,14 @@ export interface OiOhlc {
   close: number;
 }
 
+/**
+ * Host-supplied read-through source of main-resolution open-interest candles, keyed by bar open
+ * time (ms). When set on a runner/runtime, OI reads resolve through it at CALL time — late-arriving
+ * data becomes visible on the next read — and the runner's own OI series is neither accumulated nor
+ * consulted. The host owns freshness (e.g. a store rewritten wholesale on every refresh).
+ */
+export type OiProvider = (barTimeMs: number) => OiOhlc | null;
+
 export interface AuxSeriesData {
   oiByTime: Map<number, number>;
   liqLongByTime: Map<number, number>;
@@ -176,6 +196,8 @@ export interface BacktestContextOptions {
   rawConfig?: Record<string, unknown>;
   auxSeriesData?: AuxSeriesData;
   timeframeDataList?: TimeframeData[];
+  /** Live read-through OI source (main resolution only); overrides the frozen per-bar OI series. */
+  oiProvider?: OiProvider;
   /**
    * When false, funding rates are still readable by the strategy
    * (getCurrentFundingRate / getRecentFundingRates) but their cost is NOT
@@ -237,12 +259,13 @@ export interface PeriodBreakdown {
 }
 
 export interface TradingEnv {
-  openLong(size: number, options?: PositionOptions): void;
-  openShort(size: number, options?: PositionOptions): void;
+  // `sizeUsd` / `amountUsd` are QUOTE currency (USD notional) — money, NOT contract quantity.
+  openLong(sizeUsd: number, options?: PositionOptions): void;
+  openShort(sizeUsd: number, options?: PositionOptions): void;
   closeLong(): void;
   closeShort(): void;
 
-  placeLimitOrder(side: "buy" | "sell", price: number, amount: number): string;
+  placeLimitOrder(side: "buy" | "sell", price: number, amountUsd: number): string;
   cancelOrder(orderId: string): boolean;
   cancelAllOrders(): void;
   modifyOrderPrice(orderId: string, newPrice: number): boolean;
@@ -252,13 +275,19 @@ export interface TradingEnv {
   getPositionList(): Position[];
   closePosition(positionId?: string, exitReason?: string): void;
   closeAllPositions(exitReason?: string): void;
-  setStopLoss(positionIdOrPrice: string | number, price?: number): void;
+  /**
+   * Set/replace the stop-loss on a position. `reason` (id-form only) is a machine
+   * code recorded as `Trade.exitReason` when this stop fires — the player maps it to a
+   * human label. Omitted → `"stop_loss"`. Re-arming without a `reason` clears a prior one.
+   */
+  setStopLoss(positionIdOrPrice: string | number, price?: number, reason?: string): void;
   /**
    * Set/replace take-profit on an existing position (mirrors
    * `PositionOptions.takeProfit`); checked next bar before `onBar`, fills at
-   * the exact price with taker commission.
+   * the exact price with taker commission. `reason` is a machine code recorded as
+   * `Trade.exitReason` when this take fires (omitted → `"take_profit"`).
    */
-  setTakeProfit?(positionId: string, price: number): void;
+  setTakeProfit?(positionId: string, price: number, reason?: string): void;
   setPositionTag(positionId: string, tag: string): void;
   /**
    * Attach display-ready values for the strategy's `backtestColumns` to a
@@ -321,6 +350,18 @@ export interface Strategy {
    * Omitted/empty → no extra columns (only the generic base columns show).
    */
   backtestColumns?: BacktestColumnSpec[];
+  /**
+   * Which chart indicators the backtest result page should auto-show, keyed by
+   * resolution (TradingView value, e.g. "30", "60", "1D"). Values are metric
+   * columns: "cg_oi" (open interest), "cg_liq" (liquidations), "cg_ls_ratio",
+   * "volume_24h", "funding", or SMA columns like "sma_25".
+   * Omitted / no entry for a resolution → the platform default (overlay SMAs,
+   * funding only when the run's "Use Funding" is on). A given entry shows EXACTLY
+   * its columns for that resolution; funding markers appear only if "funding" is
+   * listed (independent of the "Use Funding" cost toggle). All are still
+   * toggleable by the user via the panel buttons.
+   */
+  backtestChartIndicators?: Record<string, string[]>;
   validateParams?(parsed: unknown): ParamsValidationResult;
   createTradingEnv?(innerEnv: TradingEnv, options: CreateTradingEnvOptions): TradingEnv;
   init?(env: TradingEnv): void;

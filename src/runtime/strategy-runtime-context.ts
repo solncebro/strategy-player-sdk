@@ -11,6 +11,7 @@ import type {
   FundingRate,
   MaValues,
   OiOhlc,
+  OiProvider,
   ParamValue,
   PendingOrder,
   Position,
@@ -158,6 +159,7 @@ export class StrategyRuntimeContext implements TradingEnv {
   };
   private readonly oiOhlcHistory: Array<OiOhlc | null> = [];
   private readonly oiOhlcByTime: Map<number, OiOhlc>;
+  private readonly oiProvider: OiProvider | null;
 
   private readonly timeframeStoreByRes = new Map<string, TimeframeStore>();
 
@@ -177,6 +179,7 @@ export class StrategyRuntimeContext implements TradingEnv {
     this.rawConfig = options?.rawConfig ?? {};
     this.auxSeriesData = options?.auxSeriesData ?? EMPTY_AUX_SERIES;
     this.oiOhlcByTime = new Map(options?.auxSeriesData?.oiOhlcByTime ?? []);
+    this.oiProvider = options?.oiProvider ?? null;
 
     for (const data of options?.timeframeDataList ?? []) {
       this.timeframeStoreByRes.set(data.resolution, createTimeframeStore(data));
@@ -240,12 +243,12 @@ export class StrategyRuntimeContext implements TradingEnv {
     return map.get(bar.time) ?? null;
   }
 
-  openLong(size: number, options?: PositionOptions): void {
-    this.openPositionAtMarket("long", size, options);
+  openLong(sizeUsd: number, options?: PositionOptions): void {
+    this.openPositionAtMarket("long", sizeUsd, options);
   }
 
-  openShort(size: number, options?: PositionOptions): void {
-    this.openPositionAtMarket("short", size, options);
+  openShort(sizeUsd: number, options?: PositionOptions): void {
+    this.openPositionAtMarket("short", sizeUsd, options);
   }
 
   closeLong(): void {
@@ -256,14 +259,14 @@ export class StrategyRuntimeContext implements TradingEnv {
     this.closeBySignal("short");
   }
 
-  placeLimitOrder(side: "buy" | "sell", price: number, amount: number): string {
+  placeLimitOrder(side: "buy" | "sell", price: number, amountUsd: number): string {
     const id = `order_${this.nextOrderId++}`;
     this.pendingOrderList.push({
       id,
       side,
       type: "limit",
       price,
-      amount,
+      amountUsd,
       createdAtBar: this.currentBarIndex,
     });
     return id;
@@ -334,21 +337,31 @@ export class StrategyRuntimeContext implements TradingEnv {
     }
   }
 
-  setStopLoss(positionIdOrPrice: string | number, price?: number): void {
+  setStopLoss(positionIdOrPrice: string | number, price?: number, reason?: string): void {
     if (typeof positionIdOrPrice === "number") {
       const first = this.positionById.values().next().value;
 
-      if (first) first.stopLoss = positionIdOrPrice;
+      if (first) {
+        first.stopLoss = positionIdOrPrice;
+        first.stopLossReason = reason;
+      }
     } else {
       const pos = this.positionById.get(positionIdOrPrice);
-      if (pos && price !== undefined) pos.stopLoss = price;
+
+      if (pos && price !== undefined) {
+        pos.stopLoss = price;
+        pos.stopLossReason = reason;
+      }
     }
   }
 
-  setTakeProfit(positionId: string, price: number): void {
+  setTakeProfit(positionId: string, price: number, reason?: string): void {
     const pos = this.positionById.get(positionId);
 
-    if (pos) pos.takeProfit = price;
+    if (pos) {
+      pos.takeProfit = price;
+      pos.takeProfitReason = reason;
+    }
   }
 
   getBalance(): number {
@@ -386,6 +399,9 @@ export class StrategyRuntimeContext implements TradingEnv {
   getOiOhlc(resolution?: string): OiOhlc | null {
     if (resolution === undefined) {
       if (!this.currentBar) return null;
+
+      if (this.oiProvider !== null) return this.oiProvider(this.currentBar.time);
+
       return this.oiOhlcByTime.get(this.currentBar.time) ?? null;
     }
 
@@ -398,8 +414,12 @@ export class StrategyRuntimeContext implements TradingEnv {
     return store.auxSeriesData.oiOhlcByTime?.get(bar.time) ?? null;
   }
 
+  // With a provider the main-resolution series resolves by the price bars' times at call time —
+  // index-aligned with the frozen array (barHistory never contains the current bar), late OI visible.
   getOiOhlcHistory(count: number, resolution?: string): Array<OiOhlc | null> {
     if (resolution === undefined) {
+      if (this.oiProvider !== null) return this.barHistory.slice(-count).map((bar) => this.oiProvider!(bar.time));
+
       return this.oiOhlcHistory.slice(-count);
     }
 
@@ -460,6 +480,10 @@ export class StrategyRuntimeContext implements TradingEnv {
 
   getAuxHistory(series: AuxSeriesKind, count: number, resolution?: string): Array<number | null> {
     if (resolution === undefined) {
+      if (series === "oi" && this.oiProvider !== null) {
+        return this.getOiOhlcHistory(count).map((bar) => bar?.close ?? null);
+      }
+
       return this.auxHistoryByKind[series].slice(-count);
     }
 
@@ -557,6 +581,7 @@ export class StrategyRuntimeContext implements TradingEnv {
     }
 
     this.checkPendingOrders(bar);
+    this.checkEntryBarStopLoss(bar);
     this.applyFunding(bar);
 
     this.equityList.push({
@@ -621,6 +646,8 @@ export class StrategyRuntimeContext implements TradingEnv {
   private lookupAuxOnCurrentBar(kind: AuxSeriesKind): number | null {
     if (!this.currentBar) return null;
 
+    if (kind === "oi" && this.oiProvider !== null) return this.oiProvider(this.currentBar.time)?.close ?? null;
+
     const value = this.getAuxMapByKind(kind).get(this.currentBar.time);
 
     return value === undefined ? null : value;
@@ -655,10 +682,13 @@ export class StrategyRuntimeContext implements TradingEnv {
 
   private pushAuxHistoryFor(timeMs: number): void {
     for (const kind of AUX_KIND_LIST) {
+      if (kind === "oi" && this.oiProvider !== null) continue;
+
       const value = this.getAuxMapByKind(kind).get(timeMs);
       this.auxHistoryByKind[kind].push(value === undefined ? null : value);
     }
-    this.oiOhlcHistory.push(this.oiOhlcByTime.get(timeMs) ?? null);
+
+    if (this.oiProvider === null) this.oiOhlcHistory.push(this.oiOhlcByTime.get(timeMs) ?? null);
   }
 
   private getPositionById(positionId: string): Position | null {
@@ -669,67 +699,72 @@ export class StrategyRuntimeContext implements TradingEnv {
     return { ...pos, pnl: this.calcPnl(pos, this.currentBar.close) };
   }
 
+  // Evaluate one position's stop-loss against a bar and, if breached, close it at
+  // the stop price (taker) and fire onOrderFill with a synthetic "stop" order.
+  // Returns true if the stop fired. Shared by the start-of-bar sweep (checkStopLoss)
+  // and the entry-bar sweep (checkEntryBarStopLoss).
+  private tryTriggerStopLoss(position: Position, bar: Bar): boolean {
+    if (position.stopLoss === undefined) return false;
+
+    const isTriggered =
+      position.side === "long"
+        ? bar.low <= position.stopLoss
+        : bar.high >= position.stopLoss;
+
+    if (!isTriggered) return false;
+
+    const entryPrice = position.entryPrice;
+    const runningBest = position.runningBest;
+    this.closePositionById({ positionId: position.id, exitPrice: position.stopLoss, exitReason: position.stopLossReason ?? "stop_loss", commissionType: "taker" });
+
+    if (this.strategy?.onOrderFill) {
+      this.strategy.onOrderFill(
+        {
+          id: `sl_${position.id}`,
+          side: position.side === "long" ? "sell" : "buy",
+          type: "stop",
+          price: position.stopLoss,
+          amountUsd: position.sizeUsd,
+          fillTime: bar.time,
+          positionId: position.id,
+          entryPrice,
+          runningBest,
+        },
+        this,
+      );
+    }
+
+    return true;
+  }
+
   private checkStopLoss(bar: Bar): void {
     for (const position of [...this.positionById.values()]) {
+      if (this.tryTriggerStopLoss(position, bar)) continue;
+
       if (position.side === "long") {
-        if (position.stopLoss !== undefined && bar.low <= position.stopLoss) {
-          const entryPrice = position.entryPrice;
-          const runningBest = position.runningBest;
-          this.closePositionById({ positionId: position.id, exitPrice: position.stopLoss, exitReason: "stop_loss", commissionType: "taker" });
-
-          if (this.strategy?.onOrderFill) {
-            this.strategy.onOrderFill(
-              {
-                id: `sl_${position.id}`,
-                side: "sell",
-                type: "stop",
-                price: position.stopLoss,
-                amount: position.size,
-                fillTime: bar.time,
-                positionId: position.id,
-                entryPrice,
-                runningBest,
-              },
-              this,
-            );
-          }
-          continue;
-        }
-
         if (position.takeProfit !== undefined && bar.high >= position.takeProfit) {
-          this.closePositionById({ positionId: position.id, exitPrice: position.takeProfit, exitReason: "take_profit", commissionType: "taker" });
-          continue;
+          this.closePositionById({ positionId: position.id, exitPrice: position.takeProfit, exitReason: position.takeProfitReason ?? "take_profit", commissionType: "taker" });
         }
       } else {
-        if (position.stopLoss !== undefined && bar.high >= position.stopLoss) {
-          const entryPrice = position.entryPrice;
-          const runningBest = position.runningBest;
-          this.closePositionById({ positionId: position.id, exitPrice: position.stopLoss, exitReason: "stop_loss", commissionType: "taker" });
-
-          if (this.strategy?.onOrderFill) {
-            this.strategy.onOrderFill(
-              {
-                id: `sl_${position.id}`,
-                side: "buy",
-                type: "stop",
-                price: position.stopLoss,
-                amount: position.size,
-                fillTime: bar.time,
-                positionId: position.id,
-                entryPrice,
-                runningBest,
-              },
-              this,
-            );
-          }
-          continue;
-        }
-
         if (position.takeProfit !== undefined && bar.low <= position.takeProfit) {
-          this.closePositionById({ positionId: position.id, exitPrice: position.takeProfit, exitReason: "take_profit", commissionType: "taker" });
-          continue;
+          this.closePositionById({ positionId: position.id, exitPrice: position.takeProfit, exitReason: position.takeProfitReason ?? "take_profit", commissionType: "taker" });
         }
       }
+    }
+  }
+
+  // Entry-candle stop-loss for positions opened via a LIMIT fill on THIS bar.
+  // A limit fills when price reaches its level; the adverse extreme (short: bar.high,
+  // long: bar.low) is a continuation AFTER the fill, so a breach is unambiguously
+  // post-entry — the stop is triggered at the stop price on the same candle instead of
+  // letting the position ride to a catastrophic close. Take-profit is intentionally NOT
+  // checked here (the favorable extreme sits on the pre-fill side of a limit fill, so
+  // counting it would be a false fill). Market entries are excluded: they open at
+  // bar.close inside onBar, which runs after processBar, so no such position exists yet.
+  private checkEntryBarStopLoss(bar: Bar): void {
+    for (const position of [...this.positionById.values()]) {
+      if (position.entryTime !== bar.time) continue;
+      this.tryTriggerStopLoss(position, bar);
     }
   }
 
@@ -770,7 +805,7 @@ export class StrategyRuntimeContext implements TradingEnv {
   private fillOrder(order: PendingOrder, bar: Bar): void {
     const fillPrice = order.price;
     const commissionRate = order.type === "limit" ? this.commission.makerRate : this.commission.takerRate;
-    const fillCommission = order.amount * commissionRate;
+    const fillCommission = order.amountUsd * commissionRate;
     this.totalCommission += fillCommission;
     this.balance -= fillCommission;
 
@@ -781,7 +816,7 @@ export class StrategyRuntimeContext implements TradingEnv {
       id: positionId,
       side,
       entryPrice: fillPrice,
-      size: order.amount,
+      sizeUsd: order.amountUsd,
       entryTime: bar.time,
       pnl: 0,
       runningBest: fillPrice,
@@ -795,7 +830,7 @@ export class StrategyRuntimeContext implements TradingEnv {
       side: order.side,
       type: order.type,
       price: fillPrice,
-      amount: order.amount,
+      amountUsd: order.amountUsd,
       fillTime: bar.time,
       positionId,
     };
@@ -818,7 +853,7 @@ export class StrategyRuntimeContext implements TradingEnv {
       for (const position of this.positionById.values()) {
         if (fundingRate.time >= position.entryTime) {
           const sign = position.side === "long" ? -1 : 1;
-          const cost = position.size * fundingRate.rate * sign;
+          const cost = position.sizeUsd * fundingRate.rate * sign;
           this.balance += cost;
           const current = this.fundingByPositionId.get(position.id) ?? 0;
           this.fundingByPositionId.set(position.id, current + cost);
@@ -830,13 +865,13 @@ export class StrategyRuntimeContext implements TradingEnv {
     }
   }
 
-  private openPositionAtMarket(side: "long" | "short", size: number, options?: PositionOptions): void {
+  private openPositionAtMarket(side: "long" | "short", sizeUsd: number, options?: PositionOptions): void {
     if (!this.currentBar) {
       throw new Error(`Cannot open ${side}: no current bar`);
     }
 
     const positionId = `pos_${this.nextPositionId++}`;
-    const entryCommission = size * this.commission.takerRate;
+    const entryCommission = sizeUsd * this.commission.takerRate;
     this.totalCommission += entryCommission;
     this.balance -= entryCommission;
     this.commissionByPositionId.set(positionId, entryCommission);
@@ -846,10 +881,12 @@ export class StrategyRuntimeContext implements TradingEnv {
       id: positionId,
       side,
       entryPrice: this.currentBar.close,
-      size,
+      sizeUsd,
       entryTime: this.currentBar.time,
       stopLoss: options?.stopLoss,
       takeProfit: options?.takeProfit,
+      stopLossReason: options?.stopLossReason,
+      takeProfitReason: options?.takeProfitReason,
       tag: options?.tag,
       pnl: 0,
       runningBest: this.currentBar.close,
@@ -872,8 +909,8 @@ export class StrategyRuntimeContext implements TradingEnv {
 
   private calcPnl(position: Position, exitPrice: number): number {
     return position.side === "long"
-      ? position.size * (exitPrice - position.entryPrice) / position.entryPrice
-      : position.size * (position.entryPrice - exitPrice) / position.entryPrice;
+      ? position.sizeUsd * (exitPrice - position.entryPrice) / position.entryPrice
+      : position.sizeUsd * (position.entryPrice - exitPrice) / position.entryPrice;
   }
 
   private closePositionById(args: ClosePositionByIdArgs): void {
@@ -886,7 +923,7 @@ export class StrategyRuntimeContext implements TradingEnv {
 
     if (commissionType) {
       const rate = commissionType === "maker" ? this.commission.makerRate : this.commission.takerRate;
-      exitCommission = position.size * (exitPrice / position.entryPrice) * rate;
+      exitCommission = position.sizeUsd * (exitPrice / position.entryPrice) * rate;
       this.totalCommission += exitCommission;
       this.balance -= exitCommission;
     }
@@ -896,14 +933,14 @@ export class StrategyRuntimeContext implements TradingEnv {
     const positionFunding = this.fundingByPositionId.get(positionId) ?? 0;
 
     const pnl = this.calcPnl(position, exitPrice);
-    const pnlPercent = (pnl / position.size) * 100;
+    const pnlPercent = (pnl / position.sizeUsd) * 100;
 
     this.tradeList.push({
       positionId,
       side: position.side,
       entryPrice: position.entryPrice,
       exitPrice,
-      size: position.size,
+      sizeUsd: position.sizeUsd,
       pnl,
       pnlPercent,
       entryTime: position.entryTime,

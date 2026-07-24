@@ -7,7 +7,7 @@ Stable contract between [strategy-player](https://github.com/solncebro/strategy-
 ## Install
 
 ```bash
-yarn add git+ssh://git@github.com:solncebro/strategy-player-sdk.git#v1.8.0
+yarn add git+ssh://git@github.com:solncebro/strategy-player-sdk.git#v2.1.0
 ```
 
 For local development (when working on this SDK):
@@ -102,4 +102,4 @@ describe("my strategy", () => {
 
 ## Versioning
 
-Current release is `v1.8.0`. Future `v1.x` releases add optional methods/fields only — never break or remove. Breaking changes ship as `v2.0.0` with a migration guide. See [`CHANGELOG.md`](./CHANGELOG.md).
+Current release is `v2.1.0`. Future `v2.x` releases add optional methods/fields only — never break or remove. Breaking changes ship in the next major with a migration guide. `v2.1.0` is the first `2.x` tag (`v2.0.0` was never published) and carries the breaking renames and live-port changes listed in [`CHANGELOG.md`](./CHANGELOG.md), including a migration guide from `v1.8.0`.

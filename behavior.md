@@ -1,7 +1,7 @@
 # strategy-player-sdk — Behavior Specification
 
 > **Audience:** authors of trading strategies who write code against `strategy-player-sdk`.
-> **Status:** Canonical. Pinned to `v1.8.0`. Additive evolution only — see CHANGELOG.md.
+> **Status:** Canonical. Pinned to `v2.1.0`. Evolves alongside the SDK; breaking changes are called out inline — see CHANGELOG.md for the full history and migration notes.
 >
 > Read this together with the TypeScript types in `src/types.ts` (or `dist/index.d.ts` after `yarn install`). Types alone tell you the **shape** of the API; this document tells you the **runtime semantics**.
 
@@ -73,11 +73,14 @@ For each bar in chronological order, the runtime executes:
    1.3. updateRunningBest()           // for every open position
    1.4. checkStopLoss(bar)            // SL/TP — see §4 Fill priority
    1.5. checkPendingOrders(bar)         // fill triggered pending limits, FIFO by createdAtBar
+   1.5b. checkEntryBarStopLoss(bar)     // stop-loss ONLY, for positions opened via limit fill THIS bar — see §4
    1.6. applyFunding(bar)             // fund all open positions for any funding events ≤ bar.time
    1.7. equityList.push({ barIndex, timestamp, balance: effectiveBalance })
 
 2. strategy.onBar(bar, maValues, env)
 ```
+
+Step **1.4** checks positions that already existed at the start of the bar. Step **1.5b** additionally checks the stop-loss of positions *born on this bar via a limit fill* (in 1.5), so a protective stop can trigger on the position's own entry candle — see §4. Positions opened via a **market** order live in `onBar` (step 2, at `currentBar.close`); their first stop check is the next bar's 1.4.
 
 Once at the very start (before bar 0): `strategy.init?(env)`.
 Once at the very end (after the last bar's `onBar`): `strategy.onEnd?(env)` → `forceCloseAll()`.
@@ -108,6 +111,24 @@ Within (2), each pending order is checked exactly once per bar:
 
 Fill price is always `order.price`, not the bar OHLC. (Slippage isn't modeled in v1.0.)
 
+### Entry-candle stop-loss (limit fills)
+
+A position opened by a **limit fill** (step 1.5) has its **stop-loss** evaluated on that same entry candle, immediately after the fills (step 1.5b), against the candle's adverse extreme (short → `bar.high ≥ stopLoss`; long → `bar.low ≤ stopLoss`), closing **at the stop price** (taker, `exitReason: "stop_loss"`, `onOrderFill` fired with a synthetic `type: "stop"` order). This emulates an exchange stop-market placed the instant the entry fills: a limit fills only when price reaches its level, so the adverse extreme is a continuation *after* the fill and a breach is unambiguously post-entry (a limit entered at the candle's adverse extreme — e.g. a long at the low — has no room past it, so nothing fires). For the stop to exist on the entry candle the strategy must set it **at fill** (in `onOrderFill`), not only in `onBar`.
+
+Not evaluated on the entry candle:
+- **Take-profit** — the favorable extreme sits on the *pre-fill* side of a limit fill, so counting it would be a false fill. TP is first checked on the next bar (step 1.4).
+- **Market entries** — they open at `currentBar.close` in `onBar` (after `processBar`), so the entry candle's excursion is entirely before entry; first stop check is the next bar's 1.4.
+
+### Exit-reason labels
+
+When a stop-loss or take-profit level fires, `Trade.exitReason` records the machine code the strategy attached to that level, or a default when none was given:
+- `setStopLoss(id, price, reason?)` → the stop fires with `exitReason = reason ?? "stop_loss"` (both on the entry candle, §1.5b, and on later bars, §1.4).
+- `setTakeProfit(id, price, reason?)` → the take fires with `exitReason = reason ?? "take_profit"`.
+- `PositionOptions.stopLossReason` / `takeProfitReason` do the same for stops/takes armed at open.
+- Strategy-driven market exits (`closePosition(id, reason?)` / `closeAllPositions(reason?)`) already record `reason` verbatim.
+
+The code is opaque to the runtime — it is a stable, presentation-neutral token (e.g. `"take_profit_ma200"`, `"stop_loss_emergency|15"`, `"close_stop|8"`). The runtime never parses or renders it; the **player** owns the human label and language, mapping known codes to text (`"Take Profit (MA200)"`, `"Stop Loss (emergency −15%)"`, …) and prettifying unknown codes. Re-arming a level without a `reason` clears any prior one, so the label always reflects the level active at the moment it fired. Old runs (no reason) keep `"stop_loss"` / `"take_profit"`.
+
 ---
 
 ## 5. Commission split — maker vs taker
@@ -123,8 +144,8 @@ Fill price is always `order.price`, not the bar OHLC. (Slippage isn't modeled in
 | `forceCloseAll` (end-of-data closure) | taker |
 
 Commission is applied **on both entry and exit**:
-- Entry: `size * rate` (charged immediately in account currency, deducted from `balance`).
-- Exit: `size * (exitPrice / entryPrice) * rate` (proportional to the closing notional).
+- Entry: `sizeUsd * rate` (charged immediately in account currency, deducted from `balance`).
+- Exit: `sizeUsd * (exitPrice / entryPrice) * rate` (proportional to the closing notional).
 
 Each `Trade` records its **total** commission (entry + exit) in `Trade.commission`. Net P&L per trade is:
 ```
@@ -133,7 +154,7 @@ netPnl = pnl - commission + funding
 
 `Trade.pnlPercent` is the **price-move percent** of the position, independent of notional size:
 ```
-pnlPercent = (pnl / size) * 100        // ≈ (exit - entry) / entry * 100 for long
+pnlPercent = (pnl / sizeUsd) * 100        // ≈ (exit - entry) / entry * 100 for long
 ```
 It is comparable across symbols of any price (it is **not** divided by `entryPrice` a second time, and **not** a ROI-of-deposit figure).
 
@@ -144,7 +165,7 @@ It is comparable across symbols of any price (it is **not** divided by `entryPri
 Funding rates are 8-hour interval events on Binance Futures (00:00 / 08:00 / 16:00 UTC). The runtime applies them per-position:
 
 ```
-fundingCost = position.size * fundingRate.rate * sign
+fundingCost = position.sizeUsd * fundingRate.rate * sign
 sign = -1 for long, +1 for short
 ```
 
@@ -286,8 +307,8 @@ Note the **subtle difference**: `getHistory(N)` (main TF) excludes the current b
 - `placeLimitOrder()` — each fill creates an independent position. Multi-position behavior is symmetric to `openLong`/`openShort` since v1.5.
 - `closePosition(positionId?)` without an id closes the first open position (insertion order). With an id, closes that specific position.
 - `closeAllPositions(exitReason?)` closes every open position at the current bar's close with taker commission.
-- `setStopLoss(positionId, price)` updates the SL on a specific position. `setStopLoss(price)` (single argument number) targets the first open position — kept for backward-compat with single-position strategies.
-- `setTakeProfit?(positionId, price)` sets/replaces the take-profit on an existing position — same semantics as passing `PositionOptions.takeProfit` at open: checked on the next bar's `processBar` before `onBar`, fills at the exact TP price with taker commission, exitReason `"take_profit"`, and (like any TP fill) does NOT trigger `onOrderFill` — reconcile via `getPositionList()` in `onBar`. Declared optional so strategies can feature-detect it on older runtimes (`env.setTakeProfit?.(id, price)`). Unknown `positionId` is a no-op.
+- `setStopLoss(positionId, price, reason?)` updates the SL on a specific position. `setStopLoss(price)` (single argument number) targets the first open position — kept for backward-compat with single-position strategies. `reason` (id-form) is a machine code recorded as `Trade.exitReason` when the stop fires (see §4 Exit-reason labels); omitted → `"stop_loss"`.
+- `setTakeProfit?(positionId, price, reason?)` sets/replaces the take-profit on an existing position — same semantics as passing `PositionOptions.takeProfit` at open: checked on the next bar's `processBar` before `onBar`, fills at the exact TP price with taker commission, and (like any TP fill) does NOT trigger `onOrderFill` — reconcile via `getPositionList()` in `onBar`. `exitReason = reason ?? "take_profit"` (§4). Declared optional so strategies can feature-detect it on older runtimes (`env.setTakeProfit?.(id, price)`). Unknown `positionId` is a no-op.
 
 ---
 
@@ -295,11 +316,11 @@ Note the **subtle difference**: `getHistory(N)` (main TF) excludes the current b
 
 | Method | Returns | Side effect |
 |---|---|---|
-| `openLong(size, options?)` | void | opens position at `currentBar.close`, taker commission |
-| `openShort(size, options?)` | void | opens position at `currentBar.close`, taker commission |
+| `openLong(sizeUsd, options?)` | void | opens position at `currentBar.close`, taker commission |
+| `openShort(sizeUsd, options?)` | void | opens position at `currentBar.close`, taker commission |
 | `closeLong()` | void | closes long at `currentBar.close`, exitReason `"close"`, taker |
 | `closeShort()` | void | closes short at `currentBar.close`, exitReason `"close"`, taker |
-| `placeLimitOrder(side, price, amount)` | `orderId` | queues pending limit order |
+| `placeLimitOrder(side, price, amountUsd)` | `orderId` | queues pending limit order |
 | `cancelOrder(orderId)` | `boolean` | removes pending order |
 | `cancelAllOrders()` | void | removes all pending orders |
 | `modifyOrderPrice(orderId, newPrice)` | `boolean` | mutates pending order price |
@@ -308,8 +329,8 @@ Note the **subtle difference**: `getHistory(N)` (main TF) excludes the current b
 | `getPositionList()` | `Position[]` | all open, with computed unrealized pnl |
 | `closePosition(positionId?, exitReason?)` | void | closes at `currentBar.close`, taker |
 | `closeAllPositions(exitReason?)` | void | closes every open, taker |
-| `setStopLoss(idOrPrice, price?)` | void | updates SL on a position |
-| `setTakeProfit(positionId, price)` | void | sets/replaces TP on a position; optional method, feature-detect on older runtimes |
+| `setStopLoss(idOrPrice, price?, reason?)` | void | updates SL on a position; `reason` → `Trade.exitReason` on fire (§4) |
+| `setTakeProfit(positionId, price, reason?)` | void | sets/replaces TP on a position; `reason` → `Trade.exitReason` on fire (§4); optional method, feature-detect on older runtimes |
 | `setPositionTag(positionId, tag)` | void | annotates position; tag persists into the resulting `Trade` |
 | `setPositionDisplay(positionId, data)` | void | display-ready values for `Strategy.backtestColumns`; persists into `Trade.display` on close (v1.8) |
 | `getBalance()` | number | realized balance (no unrealized PnL) |
@@ -425,14 +446,22 @@ Higher-timeframe references — added in `v1.1` (see §11.1). Params validation 
 
 ---
 
-## 19. Live module (`@solncebro/strategy-player-sdk/live`)
+## 17. Live module (`@solncebro/strategy-player-sdk/live`)
 
 Runs the SAME strategy code outside the backtest player:
 
 - **`PaperStrategyRunner`** — the exact backtest runtime fed with live closed bars ("real-time backtest"). Fills/SL/TP/commission semantics are identical to the player. `feedClosedBar(bar, maValues?)` + `drainNewEventList()` for incremental event forwarding (notifications, journaling).
 - **`LiveStrategyRunner`** — executes the strategy against a real exchange through a **`LiveExecutionPort`** the host bot implements (place/cancel entry limit, replace/cancel stop-loss & take-profit, market close + fill notifications back into the runner). One runner = one symbol+direction.
   - **Desired-state sync**: the strategy's synchronous TradingEnv calls mutate local books; after every bar / fill handler the runner diffs the desired state against the exchange-known state and issues port operations (cancels → entry placements → market closes → protective replaces).
-  - **Position aggregation**: the strategy holds N small positions (one per limit fill, as in the player) while the exchange holds ONE netted position — protective orders sync as a single exchange order for the total size (the strategy must keep one uniform protective price; the last `setStopLoss`/`setTakeProfit` price wins).
+  - **Position aggregation**: the strategy holds N small positions (one per limit fill, as in the player) while the exchange holds ONE netted position — protective orders sync as ONE logical order for the total size, physically a SET of exchange orders when the size exceeds the exchange's per-order cap (the port owns the splitting; the runner tracks the piece id list via `getStopLossExchangeOrderIdList`/`getTakeProfitExchangeOrderIdList`). The strategy must keep one uniform protective price across its positions; the last `setStopLoss`/`setTakeProfit` price wins.
+  - **Entry ladder cap-splitting**: `placeLimitOrder` books one entry order per piece via the optional `LiveExecutionPort.splitEntryNotionalUsd`, so a notional above the exchange's per-order cap is never silently reduced by the exchange. A reduced landing (`PlaceEntryOrderResult.acceptedAmountUsd` smaller than requested) shrinks the booked order and tops up the shortfall as a fresh order in the SAME sync (bounded to a few passes so a persistently-reducing exchange cannot loop forever).
+  - **Sync is serialised**: a `sync()` requested while one is already running (e.g. an exchange fill event lands mid-placement) does not run concurrently — the re-entrant call only marks a rerun, which the lock owner executes before releasing, so mid-sync state changes still materialise without doubling placements.
+  - **A finished/emptied position cancels the remaining ladder in the same sync**: `handleStopLossFilled`, `handleTakeProfitFilled`, `handleExternalPositionClose`, and any strategy-driven close that empties the book (`closePosition`/`closeAllPositions`) request-cancel every remaining entry order immediately, instead of leaving the tail for the strategy's next-bar cleanup.
+  - **`cancelOrder` confirms against the exchange**: an order not yet placed is dropped locally right away; a placed order is only MARKED for cancellation and leaves the book once the port confirms the cancel in `sync()` — a cancel lost to a transient failure keeps the order tracked and retries every cycle instead of orphaning it.
+  - **Protective coverage watchdog hooks**: `resyncProtectiveOrders()` invalidates and immediately re-syncs the protective sets (for a host's coverage watchdog to heal a detected deficit on its own cadence instead of waiting for the next bar); `setProtectiveSyncHold(isHeld)` freezes protective REPLACE placements while a protective exit is being finalized (cancels still run).
+  - **`oiProvider`** (`LiveStrategyRunnerOptions.oiProvider`): a host-supplied read-through OI source keyed by bar open time. When set, `getOiOhlc`/`getOiClose`/`getOiOhlcHistory`/`getAuxHistory("oi")` resolve through it at CALL time instead of the runner's own frozen series, and the snapshot omits `oiHistory`/`currentOiBar`. `PaperStrategyRunner`/`MockTradingEnv` accept the same option.
+  - **Real fill price, not the limit target**: a live limit fill reported through `handleEntryOrderFilled` may carry the exchange's volume-weighted `avgFillPrice`; the runner books the position — `entryPrice`, `contracts`, `runningBest`, and the `onOrderFill` price — at that fill price, falling back to the order's limit price only when it is omitted. A resting limit can fill better than its level (the market ran past it before the order landed), so every average-entry-derived level (stop, take, journal) anchors to the real fill, not the target. Backtest/paper omit it — fills there happen exactly at the limit price.
+  - **Protective reason forwarding**: the runner passes the active stop level's machine reason code (§4, e.g. `stop_loss_emergency|15`) to `LiveExecutionPort.replaceStopLoss` (`reason`), so a host port can recognise entry-anchored levels and re-derive their price from the exchange's own average entry instead of trusting the strategy's book price.
   - **TP semantics mirror the player**: `handleTakeProfitFilled` does NOT call `onOrderFill`; the strategy reconciles via `getPositionList()` on the next bar.
   - **Catch-up mode** (`startCatchUp`/`completeCatchUp`): replay history through the strategy without touching the exchange, then sync only the final desired state — for manual late entries and restart recovery.
   - **Snapshot/restore** (`getSnapshot`/`restoreSnapshot`): persists the order/position books, the rolling bar/OI history + current bar/MA, and the optional `Strategy.getStateSnapshot()`/`restoreStateSnapshot()` payload, so a host can resume after a restart with `getCurrentBar()`/`getHistory(N)`/`getMaValues`/OI accessors working **immediately** — no warm-up replay required. The bar context is bounded by the runner's `historyLimit`. (Backward-compat: a snapshot taken by an older SDK without bar context restores the books only; then `getCurrentBar()` throws until the first `feedClosedBar`/`catchUpBar`, exactly as before.)
@@ -456,7 +485,7 @@ backtestColumns: [
 Per trade, the strategy attaches **display-ready** values (already-formatted strings) keyed by column `key`; a `tooltipKey` cell reads a `BacktestTooltip` (`{ rows: [{ label, value, ranges: [{ text, matched }] }] }`):
 
 ```typescript
-env.openLong(size);
+env.openLong(sizeUsd);
 const pos = env.getPositionList()[0];
 env.setPositionDisplay?.(pos.id, {
   funding: "-0.45%",
@@ -469,15 +498,34 @@ These ride into `Trade.display` on close (exactly like `setPositionTag` → `Tra
 
 ---
 
-## 17. Versioning promise
+## 19. Backtest chart indicators (per-resolution)
 
-`v1.0.0` froze the surface; `v1.1.0` MTF; `v1.2.0` params validation; `v1.3.0` custom trading env adapter; `v1.4.0` funding history in adapter options; `v1.5.0` multi-position market opens; `v1.6.0` `allowedResolutions`; `v1.7.0` `totalPnlPercent` + `applyFundingCost` + `pnlPercent` formula bugfix; `v1.8.0` strategy-declared backtest columns (`Strategy.backtestColumns` + `Trade.display` + `setPositionDisplay`). Future `v1.x` releases:
+A strategy declares which chart indicators the backtest result page should auto-show, keyed by resolution — the strategy owns *what to visualize*, the platform just executes it:
+
+```typescript
+backtestChartIndicators: { "30": ["cg_oi"], "1D": ["sma_200"] };
+```
+
+Values are metric columns: `"cg_oi"` (open interest), `"cg_liq"` (liquidations), `"cg_ls_ratio"`, `"volume_24h"`, `"funding"`, or SMA columns (`"sma_25"`, …). Rules:
+
+- The page auto-shows **exactly** the columns listed for the run's resolution — nothing more. So SMAs used only on one timeframe don't leak onto others.
+- **Funding markers** appear only if `"funding"` is in the list. This is independent of the run's **"Use Funding" toggle**, which controls *only* whether funding cost enters PnL (like commission) — never chart display.
+- No entry for a resolution (or field omitted) → platform default: overlay SMAs, funding only when "Use Funding" is on (backward-compatible).
+- Everything stays user-toggleable via the panel buttons; the declaration sets the *initial* set.
+
+Runtime-neutral: the SDK runtime does not act on this field — the **player** reads it from the compiled strategy (like `backtestColumns`). Additive, optional.
+
+---
+
+## 20. Versioning promise
+
+`v1.0.0` froze the surface; `v1.1.0` MTF; `v1.2.0` params validation; `v1.3.0` custom trading env adapter; `v1.4.0` funding history in adapter options; `v1.5.0` multi-position market opens; `v1.6.0` `allowedResolutions`; `v1.7.0` `totalPnlPercent` + `applyFundingCost` + `pnlPercent` formula bugfix; `v1.8.0` strategy-declared backtest columns (`Strategy.backtestColumns` + `Trade.display` + `setPositionDisplay`); `v2.1.0` first `2.x` release — money fields renamed to `*Usd`, live protective orders became sets of exchange orders, `placeEntryOrder` returns a result object, `onBeforeLimitFill` removed, plus exit-reason labels, `oiProvider`, entry-notional splitting and the entry-candle stop-loss check (`v2.0.0` was never published; see CHANGELOG.md for the migration guide from `v1.8.0`). Future `v2.x` releases:
 - **may** add new optional methods to `TradingEnv` (`method?(): T | null`),
 - **may** add new optional parameters to existing `TradingEnv` methods (`foo(a, b?: string)`),
 - **may** add new optional fields to existing types (`{ existing: ..., newField?: ... }`),
 - **may not** remove or rename anything,
 - **may not** change the runtime semantics described in this file (sandbox limits, fill priority, commission split, funding signs, MFE definition, time-unit conventions, nullability rules, look-ahead protection).
 
-Breaking changes are reserved for `v2.0.0` and ship with a migration guide.
+Breaking changes are reserved for the next major version and always ship with a migration guide.
 
 The constant `API_VERSION` exported from `@solncebro/strategy-player-sdk` reflects the SDK version your strategy was bundled against. The runtime can read it for audit / mismatch detection.

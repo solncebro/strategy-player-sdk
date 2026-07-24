@@ -1,7 +1,9 @@
 {
   "name": "@solncebro/strategy-player-sdk",
-  "version": "1.8.0",
+  "version": "2.1.0",
   "private": false,
+  "license": "MIT",
+  "author": "solncebro",
   "description": "Stable contract between strategy-player backtest engine and external strategy repositories. Source-of-truth for TradingEnv types and runtime behavior.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -31,7 +33,8 @@
     "behavior.md",
     "examples",
     "README.md",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "LICENSE"
   ],
   "scripts": {
     "build": "tsc",
