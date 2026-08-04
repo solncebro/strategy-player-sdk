@@ -1478,3 +1478,43 @@ describe("LiveStrategyRunner", () => {
     expect(port.callsOf("cancelEntryOrder")).toHaveLength(0);
   });
 });
+
+// A strategy that gates on liquidity can only do so if the runner passes the turnover through. The
+// host (exchange feed) is the only one who knows it, so it rides along with each closed bar.
+describe("LiveStrategyRunner 24h volume", () => {
+  function makeVolumeReadingStrategy(seenList: Array<number | null>): Strategy {
+    return makeLadderStrategy({
+      onBar(_bar, _ma, env) {
+        seenList.push(env.getVolume24h?.() ?? null);
+      },
+    });
+  }
+
+  it("hands the 24h volume of the bar to the strategy", async () => {
+    const seenList: Array<number | null> = [];
+    const runner = new LiveStrategyRunner(makeVolumeReadingStrategy(seenList), { port: new FakeExecutionPort() });
+
+    await runner.feedClosedBar(makeBar(1000), undefined, undefined, 12_500_000);
+
+    expect(seenList).toEqual([12_500_000]);
+  });
+
+  it("reports null when the host supplies no volume, so a strategy can tell 'unknown' from 'thin'", async () => {
+    const seenList: Array<number | null> = [];
+    const runner = new LiveStrategyRunner(makeVolumeReadingStrategy(seenList), { port: new FakeExecutionPort() });
+
+    await runner.feedClosedBar(makeBar(1000));
+
+    expect(seenList).toEqual([null]);
+  });
+
+  it("keeps the volume aligned with its own bar across bars", async () => {
+    const seenList: Array<number | null> = [];
+    const runner = new LiveStrategyRunner(makeVolumeReadingStrategy(seenList), { port: new FakeExecutionPort() });
+
+    await runner.feedClosedBar(makeBar(1000), undefined, undefined, 1_000_000);
+    await runner.feedClosedBar(makeBar(2000), undefined, undefined, 9_000_000);
+
+    expect(seenList).toEqual([1_000_000, 9_000_000]);
+  });
+});

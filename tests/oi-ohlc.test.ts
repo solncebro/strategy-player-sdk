@@ -86,3 +86,69 @@ describe("open-interest OHLC contract", () => {
     expect(ctxB.getOiOhlc()).toBeNull();
   });
 });
+
+// Same story as open interest, for the 24h turnover: the paper runner learns it per closed bar (the
+// backtest player instead loads a whole series upfront), and a liquidity-gating strategy must read it.
+describe("PaperStrategyRunner 24h volume", () => {
+  function makeVolumeReadingRunner(seenList: Array<number | null>): PaperStrategyRunner {
+    const strategy = defineStrategy({
+      name: "volume-reader",
+      version: "1.0",
+      params: {},
+      onBar: (_bar, _ma, env) => {
+        seenList.push(env.getVolume24h?.() ?? null);
+      },
+    });
+
+    return new PaperStrategyRunner(strategy, { params: {} });
+  }
+
+  it("hands the 24h volume of the bar to the strategy", () => {
+    const seenList: Array<number | null> = [];
+    const runner = makeVolumeReadingRunner(seenList);
+
+    runner.feedClosedBar(makeBar(100, 1000), ZERO_MA, undefined, 12_500_000);
+
+    expect(seenList).toEqual([12_500_000]);
+  });
+
+  it("reports null when no volume was supplied, so 'unknown' stays distinguishable from 'thin'", () => {
+    const seenList: Array<number | null> = [];
+    const runner = makeVolumeReadingRunner(seenList);
+
+    runner.feedClosedBar(makeBar(100, 1000), ZERO_MA);
+
+    expect(seenList).toEqual([null]);
+  });
+
+  it("keeps each bar's volume with its own bar", () => {
+    const seenList: Array<number | null> = [];
+    const runner = makeVolumeReadingRunner(seenList);
+
+    runner.feedClosedBar(makeBar(100, 1000), ZERO_MA, undefined, 1_000_000);
+    runner.feedClosedBar(makeBar(101, 2000), ZERO_MA, undefined, 9_000_000);
+
+    expect(seenList).toEqual([1_000_000, 9_000_000]);
+  });
+});
+
+// kliner-funding (and any strategy ported from the player) asks BY resolution: getVolume24h("30").
+// A live host that names its timeframe must serve that call exactly like the player does.
+describe("PaperStrategyRunner 24h volume by resolution", () => {
+  it("serves getVolume24h(resolution) when the host names the timeframe", () => {
+    const seenList: Array<number | null> = [];
+    const strategy = defineStrategy({
+      name: "volume-reader-by-resolution",
+      version: "1.0",
+      params: {},
+      onBar: (_bar, _ma, env) => {
+        seenList.push(env.getVolume24h?.("30") ?? null);
+      },
+    });
+    const runner = new PaperStrategyRunner(strategy, { params: {}, resolution: "30" });
+
+    runner.feedClosedBar(makeBar(100, 1000), ZERO_MA, undefined, 12_500_000);
+
+    expect(seenList).toEqual([12_500_000]);
+  });
+});

@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ---
 
+## [2.2.0] — 2026-08-04
+
+Extends `TradingEnv.getVolume24h` (24h quote turnover — added in `2.1.0` for the backtest player only) to the live and paper runners, so a liquidity-gating strategy sees the same series outside the player.
+
+### Added
+
+- **`volume24hUsd?: number` on `LiveStrategyRunner.feedClosedBar`/`catchUpBar`** — the host-supplied 24h quote volume of the closed bar (the exchange feed is the only one who knows it). `LiveStrategyRunner.getVolume24h()` returns it for the current bar, `null` when the host omits it.
+- **`volume24hUsd?: number` on `PaperStrategyRunner.feedClosedBar`/`catchUpBar`** — same turnover, fed into the runtime's own volume series bar by bar (the backtest player instead loads a whole series upfront) so `getVolume24h()`/`getVolume24h(resolution)` resolve exactly as they do in the player.
+- **`MockTradingEnvOptions.resolution?: string`** — the label of the single timeframe a live/paper feed carries. `PaperStrategyRunner` sets it as the runtime's main resolution, so a strategy calling `getVolume24h(resolution)` by name (as `kliner-funding` and other player-ported strategies do) is served the same way it is in the player; omitted defaults to `"live"`.
+- `API_VERSION` bumped from `"2.1.0"` to `"2.2.0"`.
+
+### Why
+
+`getVolume24h` shipped in `2.1.0` scoped to the backtest player; a strategy gating on liquidity behaved differently live vs. backtest purely because the live/paper runners had no way to receive the turnover. This closes that gap without touching any existing call.
+
+### Compatibility
+
+- Fully additive/optional. Hosts that pass no `volume24hUsd` see `getVolume24h()` return `null`, exactly as before this release.
+
+---
+
 ## [2.1.0] — 2026-07-25
 
 First `2.x` release. Live execution is hardened after the July 2026 production incidents (doubled ladders, exchange-capped protective orders, silently reduced entries, stale open interest), money amounts in the contract are now explicitly named in USD, and protective levels carry the strategy's own exit reason. `2.0.0` was never published — this is the first tag shipping the breaking changes that were reserved for it.

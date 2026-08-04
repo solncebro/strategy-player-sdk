@@ -31,6 +31,14 @@ const DEFAULT_HISTORY_LIMIT = 1000;
  *  so an exchange that keeps reducing cannot loop forever (leftovers retry on the next sync). */
 const MAX_ENTRY_PLACEMENT_PASS_COUNT = 3;
 
+/** One closed bar plus everything the host knows about it at that moment. */
+interface AdvanceBarArgs {
+  bar: Bar;
+  maValues?: MaValues;
+  oiBar?: OiOhlc;
+  volume24hUsd?: number;
+}
+
 /**
  * Drives ONE strategy instance (= one symbol+direction) against a live exchange through a
  * LiveExecutionPort. The strategy sees the exact same TradingEnv contract as in the backtest player;
@@ -66,6 +74,8 @@ export class LiveStrategyRunner implements TradingEnv {
   private currentBarIndex = -1;
   private oiHistory: Array<OiOhlc | null> = [];
   private currentOiBar: OiOhlc | null = null;
+  /** 24h quote volume of the current bar, supplied per bar by the host (the exchange feed knows it). */
+  private currentVolume24hUsd: number | null = null;
   private desiredMarketEntry: { side: "buy" | "sell"; amountUsd: number } | null = null;
 
   private entryOrderList: LiveEntryOrderState[] = [];
@@ -102,12 +112,12 @@ export class LiveStrategyRunner implements TradingEnv {
 
   // ---------------------------------------------------------------------- runner API
 
-  async feedClosedBar(bar: Bar, maValues?: MaValues, oiBar?: OiOhlc): Promise<void> {
+  async feedClosedBar(bar: Bar, maValues?: MaValues, oiBar?: OiOhlc, volume24hUsd?: number): Promise<void> {
     this.ensureInitialized();
 
     // A bar already incorporated (time <= the last one) is skipped — no strategy run, no sync — so a
     // host that replays missed/already-seen klines after a snapshot restore does not double-process.
-    if (!this.advanceBar(bar, maValues, oiBar)) return;
+    if (!this.advanceBar({ bar, maValues, oiBar, volume24hUsd })) return;
 
     this.strategy.onBar(bar, maValues ?? ZERO_MA, this);
     await this.sync();
@@ -117,9 +127,9 @@ export class LiveStrategyRunner implements TradingEnv {
   // and WITHOUT touching the exchange — live warmup, so a fresh start does not act on signals that
   // closed before going live. Idempotent by bar time (see advanceBar): replaying a bar already in the
   // restored history is a no-op, so restore + catch-up compose without doubling history.
-  catchUpBar(bar: Bar, maValues?: MaValues, oiBar?: OiOhlc): void {
+  catchUpBar(bar: Bar, maValues?: MaValues, oiBar?: OiOhlc, volume24hUsd?: number): void {
     this.ensureInitialized();
-    this.advanceBar(bar, maValues, oiBar);
+    this.advanceBar({ bar, maValues, oiBar, volume24hUsd });
   }
 
   // Advance the rolling market context by one closed bar: push the previous bar/OI into history
@@ -127,7 +137,9 @@ export class LiveStrategyRunner implements TradingEnv {
   // false (and does nothing) when the bar is at or before the last incorporated bar — the idempotency
   // guard that lets snapshot-restore and catch-up compose without doubling history or drifting the
   // bar index. Shared by feedClosedBar and catchUpBar so the two paths cannot diverge.
-  private advanceBar(bar: Bar, maValues?: MaValues, oiBar?: OiOhlc): boolean {
+  private advanceBar(args: AdvanceBarArgs): boolean {
+    const { bar, maValues, oiBar, volume24hUsd } = args;
+
     if (this.currentBar && bar.time <= this.currentBar.time) return false;
 
     if (this.currentBar) {
@@ -148,6 +160,7 @@ export class LiveStrategyRunner implements TradingEnv {
     this.currentBar = bar;
     this.currentMaValues = maValues ?? null;
     this.currentOiBar = this.oiProvider === null ? (oiBar ?? null) : null;
+    this.currentVolume24hUsd = volume24hUsd ?? null;
     this.updateRunningBest(bar);
 
     return true;
@@ -648,6 +661,12 @@ export class LiveStrategyRunner implements TradingEnv {
 
   getOiClose(_resolution?: string): number | null {
     return this.getOiOhlc()?.close ?? null;
+  }
+
+  /** 24h quote volume of the current bar, as handed in by the host (see feedClosedBar). Null when the
+   *  host does not supply it — a strategy that gates on liquidity must then decide what that means. */
+  getVolume24h(_resolution?: string): number | null {
+    return this.currentVolume24hUsd;
   }
 
   getOiOhlc(_resolution?: string): OiOhlc | null {

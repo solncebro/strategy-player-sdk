@@ -26,6 +26,10 @@ export interface MockTradingEnvOptions {
   timeframeDataList?: TimeframeData[];
   /** Live read-through OI source; when set, the runtime neither accumulates nor reads its own OI series. */
   oiProvider?: OiProvider;
+  /** Label of the timeframe being fed ("30", "240", …). The backtest player always knows it; a live host
+   *  should pass it too, so a strategy asking for series BY resolution (e.g. getVolume24h("30")) is served
+   *  the same way it is in the player. */
+  resolution?: string;
 }
 
 export interface FeedBarInput {

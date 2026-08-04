@@ -35,4 +35,4 @@ export type {
 export type { StrategySpec, TypedTradingEnv } from "./define-strategy";
 export { defineStrategy } from "./define-strategy";
 
-export const API_VERSION = "2.1.0";
+export const API_VERSION = "2.2.0";
